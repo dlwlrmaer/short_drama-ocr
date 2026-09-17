@@ -1,0 +1,23 @@
+name: Build and Deploy OCR
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: self-hosted
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build and restart
+        run: docker compose up -d --build --remove-orphans
+
+      - name: Verify deployment
+        run: |
+          sleep 5
+          curl --fail http://localhost:8080/health
+          docker compose ps
