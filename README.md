@@ -27,7 +27,7 @@ curl -X POST http://localhost:8080/ocr/video \
 
 API 文档：`http://NAS-IP:8080/docs`
 
-Windows 11 短剧 OCR 模型与字幕区域实测见 [测试报告](docs/ocr_windows_benchmark.md)。
+Windows 11 短剧 OCR 模型选型见 [短字幕测试结论](docs/short_subtitle_model_selection.md)，首轮区域实验见 [测试报告](docs/ocr_windows_benchmark.md)。
 
 ## GitHub 部署
 

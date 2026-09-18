@@ -1,5 +1,7 @@
 # Windows 11 短剧 OCR 首轮实测（2026-09-18）
 
+五集、120 张短字幕图的最终选型见[短字幕模型选型](short_subtitle_model_selection.md)。
+
 ## 样本与方法
 
 - 机器：Windows 11，Python 3.11.9，RTX 4070 12 GB。OCR 推理均使用 CPU；Qwen3-VL 使用 Ollama 的 CUDA 后端。

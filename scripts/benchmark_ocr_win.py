@@ -12,6 +12,7 @@ import argparse
 import base64
 import json
 import re
+import shutil
 import subprocess
 import time
 import urllib.request
@@ -142,6 +143,8 @@ def prepare(args):
     from PIL import Image
 
     cues = read_srt(args.srt)
+    if args.max_chars:
+        cues = [cue for cue in cues if 1 <= len(normalize(cue["reference"])) <= args.max_chars]
     if not cues:
         raise SystemExit("No valid SRT cues found")
     if args.limit < 1:
@@ -171,6 +174,26 @@ def prepare(args):
     print(f"Extracted {len(rows)} subtitle crops to {args.out}")
 
 
+def merge(args):
+    args.out.mkdir(parents=True, exist_ok=True)
+    rows = []
+    for source in args.sources:
+        manifest = json.loads((source / "manifest.json").read_text(encoding="utf-8"))
+        samples = manifest["samples"]
+        if args.per_source and args.per_source < len(samples):
+            samples = [samples[(i * len(samples) + len(samples) // 2) // args.per_source]
+                       for i in range(args.per_source)]
+        for row in samples:
+            image_name = f"{source.name}_{row['image']}"
+            shutil.copy2(source / row["image"], args.out / image_name)
+            rows.append({**row, "image": image_name, "source": source.name})
+    result = {"sources": [str(source) for source in args.sources], "samples": rows,
+              "note": "SRT text and timing are unverified against extracted frames"}
+    (args.out / "manifest.json").write_text(
+        json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"Merged {len(rows)} frames from {len(args.sources)} episodes into {args.out}")
+
+
 def normalize(text):
     return "".join(ch.casefold() for ch in text if ch.isalnum())
 
@@ -187,9 +210,21 @@ def edit_distance(a, b):
 
 
 def make_engine(name):
-    if name == "rapidocr":
-        from rapidocr import RapidOCR
-        engine = RapidOCR()
+    if name.startswith("rapidocr"):
+        from rapidocr import ModelType, OCRVersion, RapidOCR
+        variants = {
+            "rapidocr": None,
+            "rapidocr_v6_medium": (OCRVersion.PPOCRV6, ModelType.MEDIUM),
+            "rapidocr_v5_mobile": (OCRVersion.PPOCRV5, ModelType.MOBILE),
+            "rapidocr_v5_server": (OCRVersion.PPOCRV5, ModelType.SERVER),
+        }
+        if name not in variants:
+            raise ValueError(name)
+        variant = variants[name]
+        params = ({"Det.ocr_version": variant[0], "Det.model_type": variant[1],
+                   "Rec.ocr_version": variant[0], "Rec.model_type": variant[1]}
+                  if variant else None)
+        engine = RapidOCR(params=params)
 
         def infer(path):
             result = engine(str(path))
@@ -219,7 +254,11 @@ def run(args):
     infer = make_engine(args.engine)
     load_seconds = time.perf_counter() - start
     results = []
-    for row in manifest["samples"]:
+    samples = manifest["samples"]
+    if args.limit and args.limit < len(samples):
+        samples = [samples[(i * len(samples) + len(samples) // 2) // args.limit]
+                   for i in range(args.limit)]
+    for row in samples:
         start = time.perf_counter()
         texts = infer(args.frames / row["image"])
         elapsed_ms = round((time.perf_counter() - start) * 1000)
@@ -254,14 +293,23 @@ def main():
     prep.add_argument("--srt", type=Path, required=True)
     prep.add_argument("--out", type=Path, required=True)
     prep.add_argument("--limit", type=int, default=16)
+    prep.add_argument("--max-chars", type=int, default=0,
+                      help="only sample SRT cues with at most this many alphanumeric characters")
     prep.add_argument("--roi-file", type=Path)
     prep.add_argument("--x0", type=float, default=0.1)
     prep.add_argument("--y0", type=float, default=0.44)
     prep.add_argument("--x1", type=float, default=0.85)
     prep.add_argument("--y1", type=float, default=0.78)
+    merger = commands.add_parser("merge")
+    merger.add_argument("--sources", type=Path, nargs="+", required=True)
+    merger.add_argument("--out", type=Path, required=True)
+    merger.add_argument("--per-source", type=int, default=0)
     runner = commands.add_parser("run")
     runner.add_argument("--frames", type=Path, required=True)
-    runner.add_argument("--engine", choices=["rapidocr", "paddleocr"], required=True)
+    runner.add_argument("--engine", choices=["rapidocr", "rapidocr_v6_medium",
+                                              "rapidocr_v5_mobile", "rapidocr_v5_server",
+                                              "paddleocr"], required=True)
+    runner.add_argument("--limit", type=int, help="uniformly sample N extracted frames")
     locator = commands.add_parser("locate")
     locator.add_argument("--video", type=Path, required=True)
     locator.add_argument("--srt", type=Path, required=True)
@@ -272,6 +320,8 @@ def main():
     args = parser.parse_args()
     if args.command == "prepare":
         prepare(args)
+    elif args.command == "merge":
+        merge(args)
     elif args.command == "run":
         run(args)
     else:
