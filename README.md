@@ -27,6 +27,8 @@ curl -X POST http://localhost:8080/ocr/video \
 
 API 文档：`http://NAS-IP:8080/docs`
 
+Windows 11 短剧 OCR 模型与字幕区域实测见 [测试报告](docs/ocr_windows_benchmark.md)。
+
 ## GitHub 部署
 
 将本目录推送到仓库 `dlwlrmaer/short_drama-ocr`，合并到 `main` 即会触发 `.github/workflows/deploy.yml`。
