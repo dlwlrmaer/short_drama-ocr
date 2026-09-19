@@ -18,12 +18,18 @@ import json
 import math
 import re
 import subprocess
+import sys
 import time
 from collections import Counter
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import cv2
+
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 
 BENCHMARK = Path(__file__).with_name("benchmark_ocr_win.py")
@@ -60,6 +66,16 @@ def sha256_file(path: Path) -> str:
         for block in iter(lambda: stream.read(1 << 20), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def make_engine(mode: str):
+    """Create the same checked RapidOCR provider used by the production API."""
+    from app.ocr_engine import RapidOCRProvider
+    from app.settings import Settings
+
+    provider = RapidOCRProvider(Settings(execution_mode=mode))
+    engine = provider.ensure_ready()
+    return provider, engine
 
 
 def merge_windows(windows):
@@ -303,8 +319,11 @@ def run(args):
     if set(transcripts) != expected:
         raise SystemExit(f"Need transcripts for {sorted(expected)}; got {sorted(transcripts)}")
 
-    from rapidocr import RapidOCR
-    engine = None if args.rescore else RapidOCR()
+    provider = None
+    engine = None
+    if not args.rescore:
+        provider, engine = make_engine(args.mode)
+        print(json.dumps({"provider": provider.status.to_dict()}, ensure_ascii=False), flush=True)
     frames_by_episode = {}
     episode_meta = {}
     for ep in sorted(expected):
@@ -395,6 +414,8 @@ def run(args):
     result = {
         "schema_version": "1.0", "generated_at": datetime.now(timezone(timedelta(hours=8))).isoformat(),
         "reference": "human-verified SRT only", "asr_text_used_as_truth": False,
+        "provider": (provider.status.to_dict() if provider is not None else
+                     json.loads((out / "eval_results.json").read_text(encoding="utf-8")).get("provider")),
         "schedule": {"baseline_grid_ms": GRID_MS, "dense_asr_window_ms": DENSE_MS,
                      "outside_asr_fallback_ms": GRID_MS, "asr_pad_ms": ASR_PAD_MS,
                      "cue_time_tolerance_ms": TOLERANCE_MS},
@@ -434,6 +455,7 @@ def main():
     parser.add_argument("--srt-dir", type=Path, default=DEFAULT_SRT_DIR)
     parser.add_argument("--video-dir", type=Path, default=DEFAULT_VIDEO_DIR)
     parser.add_argument("--background-per-episode", type=int, default=10)
+    parser.add_argument("--mode", choices=("auto", "cuda", "cpu"), default="auto")
     parser.add_argument("--rescore", action="store_true")
     run(parser.parse_args())
 

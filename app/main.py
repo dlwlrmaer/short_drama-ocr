@@ -1,28 +1,47 @@
 import hashlib
 import json
-import re
-import subprocess
+import shutil
 import tempfile
 from io import BytesIO
 from pathlib import Path
 from typing import Any
 
-import pytesseract
+import numpy as np
 from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.responses import JSONResponse
 from PIL import Image, UnidentifiedImageError
 
-app = FastAPI(title="NAS OCR API", version="1.0.0")
+from .contracts import MAX_TRANSCRIPT_BYTES, validate_segments
+from .ocr_engine import get_provider
+from .settings import Settings
+from .video_pipeline import process_video
+
+
+app = FastAPI(title="NAS OCR API", version="1.2.0")
 
 FRAME_PADDING_MS = 500
 FRAME_INTERVAL_MS = 1000
-MAX_TRANSCRIPT_BYTES = 10 * 1024 * 1024
-MAX_SEGMENTS = 20_000
-PTS_RE = re.compile(r"pts_time:([-+]?\d+(?:\.\d+)?)")
 
 
 @app.get("/health")
-def health() -> dict[str, str]:
-    return {"status": "ok"}
+def health():
+    provider = get_provider()
+    try:
+        provider.ensure_ready()
+        ocr_ready = True
+    except Exception:
+        ocr_ready = False
+    ffmpeg_path = shutil.which("ffmpeg")
+    ffprobe_path = shutil.which("ffprobe")
+    video_ready = ocr_ready and bool(ffmpeg_path and ffprobe_path)
+    content = {
+        "status": "ok" if video_ready else "degraded",
+        "ocr": provider.status.to_dict(),
+        "ffmpeg": {"ready": bool(ffmpeg_path and ffprobe_path),
+                   "ffmpeg": ffmpeg_path, "ffprobe": ffprobe_path},
+        "video_ocr_ready": video_ready,
+    }
+    return JSONResponse(status_code=200 if video_ready else 503, content=content)
 
 
 @app.post("/ocr")
@@ -31,34 +50,20 @@ async def ocr(file: UploadFile = File(...)) -> dict[str, str]:
         raise HTTPException(status_code=415, detail="请上传图片文件")
 
     try:
-        image = Image.open(BytesIO(await file.read()))
+        image = Image.open(BytesIO(await file.read())).convert("RGB")
         image.load()
     except (UnidentifiedImageError, OSError) as exc:
         raise HTTPException(status_code=400, detail="无法解析图片") from exc
 
-    text = pytesseract.image_to_string(image, lang="chi_sim+eng")
+    try:
+        text = get_provider().text(np.asarray(image))
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"OCR 引擎不可用: {exc}") from exc
     return {"filename": file.filename or "image", "text": text.strip()}
 
 
-def validate_segments(document: Any) -> list[dict[str, Any]]:
-    if not isinstance(document, dict) or not isinstance(document.get("segments"), list):
-        raise ValueError("transcript 必须包含 segments 数组")
-    if len(document["segments"]) > MAX_SEGMENTS:
-        raise ValueError("segments 数量超过限制")
-    validated = []
-    for index, segment in enumerate(document["segments"]):
-        if not isinstance(segment, dict):
-            raise ValueError(f"segments[{index}] 必须是对象")
-        start, end = segment.get("start_ms"), segment.get("end_ms")
-        if (isinstance(start, bool) or isinstance(end, bool) or
-                not isinstance(start, (int, float)) or not isinstance(end, (int, float)) or
-                start < 0 or end <= start):
-            raise ValueError(f"segments[{index}] 时间区间无效")
-        validated.append({"start_ms": int(start), "end_ms": int(end)})
-    return validated
-
-
 def sample_points(segments: list[dict[str, Any]], duration_ms: int | None = None) -> list[int]:
+    """保留旧的稀疏抽帧辅助函数，供既有调用和回归测试使用。"""
     points: set[int] = set()
     for segment in segments:
         start = max(0, segment["start_ms"] - FRAME_PADDING_MS)
@@ -69,58 +74,6 @@ def sample_points(segments: list[dict[str, Any]], duration_ms: int | None = None
         points.add(start)
         points.add(end)
     return sorted(points)
-
-
-def decode_frame(video_path: Path, requested_ms: int) -> tuple[bytes, int]:
-    requested_seconds = f"{requested_ms / 1000:.3f}"
-    command = ["ffmpeg", "-hide_banner", "-loglevel", "info", "-i", str(video_path),
-               "-frames:v", "1", "-vf", f"select=gte(t\\,{requested_seconds}),showinfo",
-               "-f", "image2pipe", "-vcodec", "png", "pipe:1"]
-    try:
-        result = subprocess.run(command, capture_output=True, check=False, timeout=60)
-    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
-        raise RuntimeError("FFmpeg 不可用或执行超时") from exc
-    if result.returncode != 0 or not result.stdout:
-        raise RuntimeError("FFmpeg 无法解码请求帧")
-    match = PTS_RE.search(result.stderr.decode("utf-8", errors="replace"))
-    if not match:
-        raise RuntimeError("FFmpeg 未返回真实帧 PTS")
-    actual_ms = round(float(match.group(1)) * 1000)
-    return result.stdout, actual_ms
-
-
-def image_detection(image_bytes: bytes, frame_pts_ms: int, detection_id: str) -> dict[str, Any] | None:
-    try:
-        image = Image.open(BytesIO(image_bytes))
-        image.load()
-    except (UnidentifiedImageError, OSError) as exc:
-        raise RuntimeError("FFmpeg 输出不是有效图片") from exc
-    data = pytesseract.image_to_data(image, lang="chi_sim+eng", output_type=pytesseract.Output.DICT)
-    width, height = image.size
-    words, boxes, confidences = [], [], []
-    for text, left, top, box_width, box_height, confidence in zip(
-            data.get("text", []), data.get("left", []), data.get("top", []),
-            data.get("width", []), data.get("height", []), data.get("conf", [])):
-        text = text.strip()
-        try:
-            confidence = float(confidence)
-        except (TypeError, ValueError):
-            continue
-        if text and confidence >= 0:
-            words.append(text)
-            boxes.append((int(left), int(top), int(box_width), int(box_height)))
-            confidences.append(confidence / 100)
-    if not words:
-        return None
-    x = min(item[0] for item in boxes)
-    y = min(item[1] for item in boxes)
-    right = max(item[0] + item[2] for item in boxes)
-    bottom = max(item[1] + item[3] for item in boxes)
-    return {"id": detection_id, "frame_pts_ms": frame_pts_ms,
-            "bbox": [x / width, y / height, (right - x) / width, (bottom - y) / height],
-            "ocr_text": "".join(words), "confidence": round(sum(confidences) / len(confidences), 3),
-            "engine_version": f"pytesseract@{getattr(pytesseract, '__version__', 'unknown')}",
-            "kind": "subtitle", "asr_text_prompted": False}
 
 
 @app.post("/ocr/video")
@@ -142,13 +95,12 @@ async def video_ocr(video: UploadFile = File(...), transcript: UploadFile = File
             while chunk := await video.read(1024 * 1024):
                 digest.update(chunk)
                 target.write(chunk)
-        detections = []
         try:
-            for index, requested_ms in enumerate(sample_points(segments)):
-                frame, actual_ms = decode_frame(video_path, requested_ms)
-                detection = image_detection(frame, actual_ms, f"frame-{index + 1:06d}")
-                if detection:
-                    detections.append(detection)
+            provider = get_provider()
+            provider.ensure_ready()
+            detections = process_video(video_path, segments, provider, Settings.from_env())
         except RuntimeError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail=f"OCR 引擎不可用: {exc}") from exc
     return {"media_id": digest.hexdigest(), "timebase": "video_ms", "detections": detections}

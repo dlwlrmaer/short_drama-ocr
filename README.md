@@ -1,10 +1,64 @@
 # NAS OCR
 
-一个可通过 Docker 部署的中英文 OCR API。推送到 `main` 后，NAS 上的 GitHub self-hosted runner 会自动构建并启动服务。
+一个面向短剧字幕的中英文 OCR API。服务按操作系统动态选择 OCR profile，也可以用环境变量固定配置；推送到 `main` 后，NAS 上的 GitHub self-hosted runner 仍可自动构建并启动 CPU 服务。
+
+## 动态运行配置
+
+| `OCR_RUNTIME_PROFILE` | 默认模型 | 默认执行模式 | 用途 |
+| --- | --- | --- | --- |
+| `auto` | 按操作系统选择 | 按操作系统选择 | 默认值；Windows 选 `win11`，Linux 选 `linux-low-vram` |
+| `win11` | PP-OCRv6 small | `auto`，CUDA 可用时优先 | Windows 11 开发机和 RTX 显卡 |
+| `linux-low-vram` | PP-OCRv5 mobile | `cpu` | Linux 小主机；默认不占用 2GB 显存 |
+
+配置优先级为显式环境变量高于 profile 默认值。可用变量：
+
+- `OCR_RUNTIME_PROFILE=auto|win11|linux-low-vram`
+- `OCR_EXECUTION_MODE=auto|cuda|cpu`，覆盖 profile 的执行模式
+- `OCR_MODEL_PROFILE=ppocrv6-small|ppocrv5-mobile`，覆盖 profile 的模型
+- `OCR_GPU_DEVICE_ID=0`，指定 CUDA 设备
+
+`/health` 会返回 `requested_profile`、`active_profile`、`model`、`requested_mode` 和 `actual_provider`，用于确认实际生效配置。Linux 2GB 显存机器若明确想尝试 GPU，可同时设置 `OCR_EXECUTION_MODE=cuda`；CUDA 初始化或显存不足时会直接报错，不会伪装成 GPU 推理。
+
+## Windows 11 本机运行
+
+前置条件：Python 3.11 x64、FFmpeg（`ffmpeg` 和 `ffprobe` 均在 PATH）以及最新 NVIDIA 驱动。RTX 显卡推荐 CUDA 模式；无需 Docker、WSL、Ollama 或 Tesseract。
+
+```powershell
+# 自动检测 NVIDIA 显卡并安装 GPU 或 CPU 依赖
+powershell -ExecutionPolicy Bypass -File scripts\setup_win11.ps1 -Mode auto
+
+# 显式 GPU 安装与预热；CUDA 不可用时直接报错
+powershell -ExecutionPolicy Bypass -File scripts\setup_win11.ps1 -Mode cuda
+
+# 启动服务
+powershell -ExecutionPolicy Bypass -File scripts\run_win11.ps1 -Mode auto
+
+# 本机健康、图片和生成视频冒烟测试
+$env:OCR_EXECUTION_MODE = 'cuda'
+.\.venv\Scripts\python.exe scripts\smoke_win11.py `
+  --image data\ocr_benchmark\short_mix120\short_down1_frame_001.png
+```
+
+执行模式：
+
+- `auto`：实际 CUDA 模型会话可用时使用 GPU，否则记录原因并回退 CPU。
+- `cuda`：要求检测、分类和识别会话均以 `CUDAExecutionProvider` 为第一 Provider，禁止静默回退。
+- `cpu`：明确使用 `CPUExecutionProvider`。
+
+访问 `http://localhost:8080/health` 检查 `requested_mode`、`actual_provider`、三类模型的 `session_providers`、GPU 名称和回退原因。看到 NVIDIA 驱动或安装了 `onnxruntime-gpu` 并不等于实际使用 GPU，应以这里的模型会话 Provider 为准。
+
+若 CUDA 初始化失败，先重新运行 `setup_win11.ps1 -Mode cuda` 清理冲突的 ONNX Runtime 包。仍失败时检查健康响应中的 DLL/Provider 错误、NVIDIA 驱动以及 CUDA/cuDNN 版本。需要临时恢复服务可使用 `run_win11.ps1 -Mode cpu`。
 
 ## 本地运行
 
 ```bash
+# Linux 直接运行：自动选择低显存 CPU profile
+python3 -m venv .venv
+. .venv/bin/activate
+pip install -r requirements-cpu.txt
+OCR_RUNTIME_PROFILE=auto uvicorn app.main:app --host 0.0.0.0 --port 8080
+
+# Docker Compose 已显式设置 linux-low-vram
 docker compose up -d --build
 curl http://localhost:8080/health
 curl -X POST -F 'file=@test.png' http://localhost:8080/ocr
@@ -12,7 +66,27 @@ curl -X POST -F 'file=@test.png' http://localhost:8080/ocr
 
 ## 视频 ASR 抽帧 OCR
 
-服务需要 FFmpeg，并提供 `/ocr/video` 接口。上传字段为 `video`（视频文件）和
+服务需要 FFmpeg。Win11 上可直接把 ASR 生成的 `transcript.json` 传给 OCR；程序会读取其中的 `source_file`，校验它的 SHA-256 与 `media_id` 一致，并在 transcript 同目录原子写出可供 ASR `ocr-propose` 使用的 `ocr_evidence.json`：
+
+```powershell
+.\.venv\Scripts\python.exe scripts\ocr_from_asr.py `
+  E:\short_drama\asr\output\episode\transcript.json `
+  --profile win11 `
+  --mode cuda
+
+# source_file 已迁移时可以显式覆盖，但仍会核对 media_id
+.\.venv\Scripts\python.exe scripts\ocr_from_asr.py `
+  E:\short_drama\asr\output\episode\transcript.json `
+  --video E:\media\episode.mp4 `
+  --output E:\short_drama\asr\output\episode\ocr_evidence.json `
+  --mode auto
+```
+
+Python 调用方也可以直接调用 `app.asr_adapter.run_asr_transcript()` 和 `save_evidence()`。适配层只读取 segment 的时间字段，不会把 `asr_text` 作为识别提示。
+
+生产视频管线会先将候选时刻映射到真实帧 PTS，再由一个 FFmpeg 进程批量导出全部去重候选。第 31 集的 306 个候选在 RTX 4070 上从逐点解码约 572 秒缩短到 80.349 秒，输出的 13 条 detection 与优化前 JSON 完全一致。
+
+服务另外保留 `/ocr/video` 上传接口。上传字段为 `video`（视频文件）和
 `transcript`（参考 `short_drama-asr` 的 UTF-8 JSON，至少包含带 `start_ms`、
 `end_ms` 的 `segments`）。每条片段前后扩展 500ms，约每秒抽取一帧，返回与
 ASR OCR 契约兼容的 `media_id`、`timebase` 和 `detections`：
@@ -28,6 +102,22 @@ curl -X POST http://localhost:8080/ocr/video \
 API 文档：`http://NAS-IP:8080/docs`
 
 Windows 11 短剧 OCR 模型选型见 [短字幕测试结论](docs/short_subtitle_model_selection.md)，首轮区域实验见 [测试报告](docs/ocr_windows_benchmark.md)。
+
+RTX 4070 的实际 CUDA/CPU Provider 对照见 [Win11 GPU 测试](docs/win11_gpu_benchmark_2026-09-19.md)。24 张同样本中 CUDA 与 CPU 质量指标一致，CUDA P50 约 108ms，当前本机推荐 `auto`/CUDA。
+
+## Win11 GPU/CPU 对照
+
+在同一份已准备的帧样本上运行：
+
+```powershell
+$env:OCR_EXECUTION_MODE = 'cuda'
+.\.venv\Scripts\python.exe scripts\benchmark_provider_win.py `
+  --frames data\ocr_benchmark\short_mix120 `
+  --modes cuda cpu `
+  --out data\ocr_benchmark\provider_comparison.json
+```
+
+报告包含实际 Provider、吞吐量、预热后 P50/P95、端到端耗时、完全匹配和代理 CER。只有 CUDA 实际提速且质量指标不退化时，才把 GPU 标为当前机器的推荐路径。
 
 ## GitHub 部署
 

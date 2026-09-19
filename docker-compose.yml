@@ -3,6 +3,8 @@ services:
     build: .
     container_name: ocr-app
     restart: unless-stopped
+    environment:
+      OCR_RUNTIME_PROFILE: linux-low-vram
     ports:
       - "8080:8080"
     healthcheck:

@@ -7,7 +7,24 @@ from fastapi.testclient import TestClient
 from PIL import Image
 from io import BytesIO
 
+import app.main as main_module
 from app.main import app, sample_points, validate_segments
+
+
+class FakeStatus:
+    def to_dict(self):
+        return {"ready": True, "requested_mode": "cpu",
+                "actual_provider": "CPUExecutionProvider"}
+
+
+class FakeProvider:
+    status = FakeStatus()
+
+    def ensure_ready(self):
+        return self
+
+    def text(self, _image):
+        return "字幕"
 
 
 def test_sample_points_expands_segments_and_deduplicates():
@@ -34,9 +51,73 @@ def test_media_id_is_sha256(tmp_path: Path):
 
 
 def test_existing_image_endpoint_remains_compatible(monkeypatch):
-    monkeypatch.setattr("app.main.pytesseract.image_to_string", lambda image, lang: "字幕")
+    monkeypatch.setattr(main_module, "get_provider", lambda: FakeProvider())
     image_bytes = BytesIO()
     Image.new("RGB", (2, 2), "white").save(image_bytes, format="PNG")
     response = TestClient(app).post("/ocr", files={"file": ("caption.png", image_bytes.getvalue(), "image/png")})
     assert response.status_code == 200
     assert response.json() == {"filename": "caption.png", "text": "字幕"}
+
+
+def test_image_endpoint_returns_empty_text_when_no_boxes(monkeypatch):
+    provider = FakeProvider()
+    provider.text = lambda _image: ""
+    monkeypatch.setattr(main_module, "get_provider", lambda: provider)
+    image_bytes = BytesIO()
+    Image.new("RGB", (2, 2), "white").save(image_bytes, format="PNG")
+    response = TestClient(app).post(
+        "/ocr", files={"file": ("blank.png", image_bytes.getvalue(), "image/png")})
+    assert response.status_code == 200
+    assert response.json()["text"] == ""
+
+
+def test_video_endpoint_preserves_contract_and_ignores_asr_text(monkeypatch):
+    monkeypatch.setattr(main_module, "get_provider", lambda: FakeProvider())
+    captured = []
+
+    def fake_process(path, segments, provider, settings):
+        captured.append(segments)
+        return [{"id": "segment-000001", "segment_index": 0,
+                 "frame_pts_ms": 1100, "bbox": [0.1, 0.7, 0.2, 0.05],
+                 "ocr_text": "妈", "confidence": 0.99,
+                 "engine_version": "fake", "kind": "subtitle",
+                 "asr_text_prompted": False, "selection": {"evidence": "fake"}}]
+
+    monkeypatch.setattr(main_module, "process_video", fake_process)
+    transcript = {"segments": [{"start_ms": 1000, "end_ms": 1300, "text": "错误提示"}]}
+    response = TestClient(app).post("/ocr/video", files={
+        "video": ("episode.mp4", b"video", "video/mp4"),
+        "transcript": ("transcript.json", json.dumps(transcript).encode(), "application/json"),
+    })
+    assert response.status_code == 200
+    body = response.json()
+    assert body["media_id"] == hashlib.sha256(b"video").hexdigest()
+    assert body["timebase"] == "video_ms"
+    assert body["detections"][0]["asr_text_prompted"] is False
+    assert captured == [[{"start_ms": 1000, "end_ms": 1300}]]
+
+
+def test_health_exposes_provider_and_ffmpeg(monkeypatch):
+    monkeypatch.setattr(main_module, "get_provider", lambda: FakeProvider())
+    monkeypatch.setattr(main_module.shutil, "which", lambda name: f"C:/tools/{name}.exe")
+    response = TestClient(app).get("/health")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ocr"]["actual_provider"] == "CPUExecutionProvider"
+    assert body["video_ocr_ready"] is True
+
+
+def test_health_is_degraded_when_ocr_or_ffmpeg_is_unavailable(monkeypatch):
+    class FailedProvider(FakeProvider):
+        status = FakeStatus()
+
+        def ensure_ready(self):
+            self.status.to_dict = lambda: {"ready": False, "error": "CUDA DLL missing"}
+            raise RuntimeError("CUDA DLL missing")
+
+    monkeypatch.setattr(main_module, "get_provider", lambda: FailedProvider())
+    monkeypatch.setattr(main_module.shutil, "which", lambda _name: None)
+    response = TestClient(app).get("/health")
+    assert response.status_code == 503
+    assert response.json()["ocr"]["error"] == "CUDA DLL missing"
+    assert response.json()["ffmpeg"]["ready"] is False

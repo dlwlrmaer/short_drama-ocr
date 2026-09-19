@@ -248,7 +248,7 @@ def metric_block(rows):
     return BASE.metric_block(rows)
 
 
-def summarize(name, rows, trim_ms, background_fp, elapsed_ms):
+def summarize(name, rows, trim_ms, background_fp, background_probes, elapsed_ms):
     pure1 = [row for row in rows if len(row["text"]) == 1]
     band12 = [row for row in rows if 1 <= len(row["text"]) <= 2]
     band34 = [row for row in rows if 3 <= len(row["text"]) <= 4]
@@ -266,6 +266,7 @@ def summarize(name, rows, trim_ms, background_fp, elapsed_ms):
         "empty_results": sum(row["empty"] for row in rows),
         "inserted_noise_results": sum(row["insertions"] > 0 for row in rows),
         "background_false_positive_frames": background_fp,
+        "background_probe_frames": background_probes,
         "single_char_confirmed": sum(row.get("evidence") == "confirmed_box_track"
                                      for row in pure1),
         "single_char_fallbacks": sum("fallback" in row.get("evidence", "") for row in pure1),
@@ -303,11 +304,11 @@ def augment_cache(args, targets, source_frames, planned, reasons):
                 document["frames"] = augmented[ep]
                 path.write_text(json.dumps(document, ensure_ascii=False, indent=2) + "\n",
                                 encoding="utf-8")
-        return {ep: [row for row in rows if row["boundary_trims"]]
-                for ep, rows in augmented.items()}
+        return ({ep: [row for row in rows if row["boundary_trims"]]
+                 for ep, rows in augmented.items()}, None)
 
-    from rapidocr import RapidOCR
-    engine = RapidOCR()
+    provider, engine = BASE.make_engine(args.mode)
+    print(json.dumps({"provider": provider.status.to_dict()}, ensure_ascii=False), flush=True)
     for ep in sorted(source_frames):
         path = cache_dir / f"episode_{ep:02d}.json"
         existing_document = (json.loads(path.read_text(encoding="utf-8"))
@@ -344,7 +345,7 @@ def augment_cache(args, targets, source_frames, planned, reasons):
                                    ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         augmented[ep] = [row for row in stored_rows if row["boundary_trims"]]
         print(f"episode {ep:02d}: {len(augmented[ep])} active boundary frames", flush=True)
-    return augmented
+    return augmented, provider.status.to_dict()
 
 
 def baseline_e_rows(targets, source_frames):
@@ -367,7 +368,7 @@ def run(args):
     source_frames, source_checksums = load_source(args.source, targets)
     planned, reasons = planned_augmentations(targets, source_frames)
     ocr_started = time.perf_counter()
-    augmented = augment_cache(args, targets, source_frames, planned, reasons)
+    augmented, provider_status = augment_cache(args, targets, source_frames, planned, reasons)
     augmentation_wall_seconds = round(time.perf_counter() - ocr_started, 3) if not args.rescore else None
     combined = {ep: sorted(source_frames[ep] + augmented[ep], key=lambda row: row["pts_ms"])
                 for ep in source_frames}
@@ -382,6 +383,7 @@ def run(args):
     base_summary = next(row for row in source_eval["configs"]
                         if row["name"] == "E_dense250_roi082_yfilter_midpoint")
     background_fp = base_summary["background_false_positive_frames"]
+    background_probes = base_summary["background_probe_frames"]
     details = {"E_before": baseline_e_rows(targets, source_frames)}
     summaries = [{**base_summary, "name": "E_before", "trim_ms": 0,
                   "selection_wall_ms": 0}]
@@ -392,7 +394,7 @@ def run(args):
             rows = score_config(targets, combined, trim, quality)
             elapsed = round((time.perf_counter() - started) * 1000, 3)
             details[name] = rows
-            summaries.append(summarize(name, rows, trim, background_fp, elapsed))
+            summaries.append(summarize(name, rows, trim, background_fp, background_probes, elapsed))
 
     # The 100 ms variant is the deployment candidate unless it fails the frozen
     # recall/background guardrail; 150 ms remains an intentionally stricter ablation.
@@ -404,6 +406,7 @@ def run(args):
               candidate["background_false_positive_frames"] <= background_fp)
     result = {
         "schema_version": "1.0",
+        "provider": provider_status or (previous_result or source_eval).get("provider"),
         "generated_at": datetime.now(timezone(timedelta(hours=8))).isoformat(),
         "reference": "human-verified SRT only", "asr_text_used_as_truth": False,
         "source_cache": source_checksums,
@@ -452,6 +455,7 @@ def main():
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
     parser.add_argument("--srt-dir", type=Path, default=BASE.DEFAULT_SRT_DIR)
     parser.add_argument("--video-dir", type=Path, default=BASE.DEFAULT_VIDEO_DIR)
+    parser.add_argument("--mode", choices=("auto", "cuda", "cpu"), default="auto")
     parser.add_argument("--rescore", action="store_true")
     run(parser.parse_args())
 
