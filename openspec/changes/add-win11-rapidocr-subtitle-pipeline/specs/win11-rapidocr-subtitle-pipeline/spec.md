@@ -8,7 +8,7 @@
 
 ### Requirement: Runtime SHALL select a host profile with explicit overrides
 
-系统 SHALL 支持 `auto`、`win11` 与 `linux-low-vram` 三种运行 profile。`auto` SHALL 在 Windows 解析为 `win11`，使用 PP-OCRv6 small 与 `auto` 执行模式；在 Linux 解析为 `linux-low-vram`，使用 PP-OCRv5 mobile 与 `cpu` 执行模式，从而默认不占用低显存主机的 GPU。`OCR_EXECUTION_MODE`、`OCR_MODEL_PROFILE` 与 `OCR_GPU_DEVICE_ID` SHALL 能覆盖 profile 默认值。健康检查 SHALL 返回请求 profile、实际 profile、模型和实际 Provider。
+系统 SHALL 支持 `auto`、`win11`、`linux` 与 `linux-low-vram` 运行 profile。`auto` SHALL 检测操作系统、系统内存、NVIDIA GPU 与显存：Windows 解析为 `win11`；Linux 在 NVIDIA 显存不少于 4GB 时解析为 `linux`，否则解析为 `linux-low-vram`。`win11/linux` SHALL 使用 PP-OCRv6 small、CUDA 优先和自适应背景抑制；`linux-low-vram` SHALL 使用 PP-OCRv5 mobile、CPU 和单分支空间遮罩。`OCR_EXECUTION_MODE`、`OCR_MODEL_PROFILE`、`OCR_BACKGROUND_SUPPRESSION`、`OCR_MAX_BATCH_IMAGES` 与 `OCR_GPU_DEVICE_ID` SHALL 能覆盖自动默认值。健康检查 SHALL 返回请求 profile、实际 profile、硬件分级、检测到的系统/显存、批量上限、背景抑制、模型和实际 Provider。
 
 #### Scenario: Auto profile runs on Windows 11
 - **WHEN** 用户未显式选择 profile 且在 Windows 11 启动服务
@@ -16,7 +16,12 @@
 
 #### Scenario: Auto profile protects a Linux host with 2GB VRAM
 - **WHEN** 用户未显式选择 profile 且在 Linux 启动服务
+- **AND** 检测到 NVIDIA 显存为 2GB
 - **THEN** 系统选择 `linux-low-vram`、加载 PP-OCRv5 mobile，并只创建 CPU Provider 会话
+
+#### Scenario: Auto profile uses a capable Linux GPU
+- **WHEN** 用户未显式选择 profile且 Linux 主机的 NVIDIA 显存不少于 4GB
+- **THEN** 系统选择 `linux`、加载 PP-OCRv6 small，并以 `auto` 执行模式尝试 CUDA
 
 #### Scenario: Explicit settings override profile defaults
 - **WHEN** 用户设置有效的执行模式或模型环境变量
@@ -70,6 +75,22 @@
 - **WHEN** 上传内容不是图片类型或无法解码为图片
 - **THEN** 系统返回可诊断的 HTTP 4xx 响应且不执行 OCR 推理
 
+### Requirement: Image OCR SHALL accept single and bounded batch inputs
+
+系统 SHALL 保留 `POST /ocr` 单图接口，并 SHALL 提供 `POST /ocr/batch` 多图接口。批量接口 SHALL 保持上传顺序，逐张解码和推理，共用进程级 Provider，并 SHALL 返回包含 `index`、`filename`、`text` 的结果数组。系统 SHALL 根据硬件 profile 限制单批图片数，且 SHALL NOT 同时保留整批未压缩图片。
+
+#### Scenario: Batch preserves order and provider reuse
+- **WHEN** 客户端上传多张有效图片
+- **THEN** 系统按输入顺序返回全部结果，并只复用同一个已就绪 OCR Provider
+
+#### Scenario: Batch exceeds the active hardware limit
+- **WHEN** 上传图片数量超过当前 profile 的批量上限
+- **THEN** 系统在解码图片前返回 HTTP 413 和实际批量上限
+
+#### Scenario: Full-frame subtitle input enables suppression
+- **WHEN** 单图或批量图片请求设置 `subtitle=true`
+- **THEN** 系统在 OCR 前应用字幕 ROI 与 profile 对应的背景遮罩，并在 OCR 后继续应用字幕框中心过滤
+
 ### Requirement: Video candidate schedule SHALL combine global fallback and timed dense sampling
 
 系统 SHALL 根据视频时长生成包含首尾边界的 1000ms 全片网格，并为 transcript 中每个有效 segment 生成前后各扩展 500ms、间隔 250ms 的加密候选；所有请求点 SHALL 限制在视频范围内、去重并排序。系统 SHALL 使用解码得到的真实帧 PTS，并 SHALL 将与请求点相差超过 40ms 的帧标记为不可用于内部边界判定。
@@ -84,7 +105,7 @@
 
 ### Requirement: Subtitle OCR SHALL use the frozen region and box filter defaults
 
-系统 SHALL 默认只识别归一化全画面区域 `[0.10, 0.44, 0.85, 0.82]`，并 SHALL 只把换算到全画面后纵向中心位于 `0.715–0.815` 的文字框用于字幕文本、置信度与合并框。返回的 `bbox` SHALL 使用全画面的归一化 `[x,y,width,height]` 坐标并将各值限制在 0 到 1。
+系统 SHALL 默认只识别归一化全画面区域 `[0.10, 0.44, 0.85, 0.82]`，在 OCR 前 SHALL 能将字幕中心带及其安全边距之外的 ROI 像素涂黑，并 SHALL 只把换算到全画面后纵向中心位于 `0.715–0.815` 的文字框用于字幕文本、置信度与合并框。自适应模式 SHALL 比较原始 ROI 与空间遮罩 ROI，低资源模式 SHALL 只运行空间遮罩分支。返回的 `bbox` SHALL 使用全画面的归一化 `[x,y,width,height]` 坐标并将各值限制在 0 到 1。
 
 #### Scenario: Background text is outside the subtitle band
 - **WHEN** OCR 同时检测到字幕带内文字框和纵向中心位于过滤带外的标识或道具文字框

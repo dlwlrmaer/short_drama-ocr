@@ -6,18 +6,23 @@
 
 | `OCR_RUNTIME_PROFILE` | 默认模型 | 默认执行模式 | 用途 |
 | --- | --- | --- | --- |
-| `auto` | 按操作系统选择 | 按操作系统选择 | 默认值；Windows 选 `win11`，Linux 选 `linux-low-vram` |
+| `auto` | 按系统与硬件选择 | 按系统与硬件选择 | 默认值；检测系统内存、NVIDIA 显存和操作系统 |
 | `win11` | PP-OCRv6 small | `auto`，CUDA 可用时优先 | Windows 11 开发机和 RTX 显卡 |
+| `linux` | PP-OCRv6 small | `auto`，CUDA 可用时优先 | Linux 且 NVIDIA 显存不少于 4GB |
 | `linux-low-vram` | PP-OCRv5 mobile | `cpu` | Linux 小主机；默认不占用 2GB 显存 |
 
 配置优先级为显式环境变量高于 profile 默认值。可用变量：
 
-- `OCR_RUNTIME_PROFILE=auto|win11|linux-low-vram`
+- `OCR_RUNTIME_PROFILE=auto|win11|linux|linux-low-vram`
 - `OCR_EXECUTION_MODE=auto|cuda|cpu`，覆盖 profile 的执行模式
 - `OCR_MODEL_PROFILE=ppocrv6-small|ppocrv5-mobile`，覆盖 profile 的模型
 - `OCR_GPU_DEVICE_ID=0`，指定 CUDA 设备
+- `OCR_BACKGROUND_SUPPRESSION=off|spatial|adaptive`，控制字幕背景硬遮罩
+- `OCR_MAX_BATCH_IMAGES=1..64`，覆盖根据系统内存计算的批量上限
 
-`/health` 会返回 `requested_profile`、`active_profile`、`model`、`requested_mode` 和 `actual_provider`，用于确认实际生效配置。Linux 2GB 显存机器若明确想尝试 GPU，可同时设置 `OCR_EXECUTION_MODE=cuda`；CUDA 初始化或显存不足时会直接报错，不会伪装成 GPU 推理。
+`auto` 在 Windows 选择 Win11 配置；在 Linux 上检测到不少于 4GB NVIDIA 显存时选择 `linux`，否则选择 `linux-low-vram`。系统内存低于 8GB、8–16GB 和更高配置时，默认单批上限分别为 8、16 和 32 张；低显存 profile 最高默认 16 张。`/health` 会返回 `requested_profile`、`active_profile`、`hardware_tier`、系统/显存、批量上限、背景抑制、模型和实际 Provider。
+
+Linux 2GB 显存机器若明确想尝试 GPU，可设置 `OCR_EXECUTION_MODE=cuda`；CUDA 初始化或显存不足时会直接报错，不会伪装成 GPU 推理。
 
 ## Windows 11 本机运行
 
@@ -62,7 +67,17 @@ OCR_RUNTIME_PROFILE=auto uvicorn app.main:app --host 0.0.0.0 --port 8080
 docker compose up -d --build
 curl http://localhost:8080/health
 curl -X POST -F 'file=@test.png' http://localhost:8080/ocr
+
+# 输入是完整视频帧时，启用字幕 ROI、背景遮罩和字幕框过滤
+curl -X POST -F 'file=@frame.png' 'http://localhost:8080/ocr?subtitle=true'
+
+# 批量图片，保持输入顺序返回；上限由硬件配置决定
+curl -X POST 'http://localhost:8080/ocr/batch?subtitle=true' \
+  -F 'files=@frame-001.png' \
+  -F 'files=@frame-002.png'
 ```
+
+单图接口继续返回 `{filename, text}`。批量接口返回 `{count, results}`，其中每条结果包含 `index`、`filename` 和 `text`。批量处理逐张解码和推理，共用同一个已预热模型，不会同时把整批未压缩图片留在内存中。`subtitle=true` 表示输入是完整视频帧：程序会应用字幕 ROI、空间背景遮罩和字幕框过滤；普通文档图片不要开启。
 
 ## 视频 ASR 抽帧 OCR
 

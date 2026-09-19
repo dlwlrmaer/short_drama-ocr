@@ -1,6 +1,7 @@
 import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -20,10 +21,17 @@ class FakeStatus:
 class FakeProvider:
     status = FakeStatus()
 
+    def __init__(self):
+        self.ready_calls = 0
+        self.text_calls = 0
+        self.settings = SimpleNamespace(max_batch_images=32)
+
     def ensure_ready(self):
+        self.ready_calls += 1
         return self
 
     def text(self, _image):
+        self.text_calls += 1
         return "字幕"
 
 
@@ -69,6 +77,47 @@ def test_image_endpoint_returns_empty_text_when_no_boxes(monkeypatch):
         "/ocr", files={"file": ("blank.png", image_bytes.getvalue(), "image/png")})
     assert response.status_code == 200
     assert response.json()["text"] == ""
+
+
+def test_batch_image_endpoint_preserves_order_and_reuses_provider(monkeypatch):
+    provider = FakeProvider()
+    monkeypatch.setattr(main_module, "get_provider", lambda: provider)
+    first = BytesIO()
+    second = BytesIO()
+    Image.new("RGB", (2, 2), "white").save(first, format="PNG")
+    Image.new("RGB", (3, 3), "black").save(second, format="PNG")
+
+    response = TestClient(app).post("/ocr/batch", files=[
+        ("files", ("first.png", first.getvalue(), "image/png")),
+        ("files", ("second.png", second.getvalue(), "image/png")),
+    ])
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "count": 2,
+        "results": [
+            {"index": 0, "filename": "first.png", "text": "字幕"},
+            {"index": 1, "filename": "second.png", "text": "字幕"},
+        ],
+    }
+    assert provider.ready_calls == 1
+    assert provider.text_calls == 2
+
+
+def test_batch_image_endpoint_rejects_invalid_item_and_oversized_batch(monkeypatch):
+    monkeypatch.setattr(main_module, "get_provider", lambda: FakeProvider())
+    client = TestClient(app)
+    invalid = client.post("/ocr/batch", files=[
+        ("files", ("note.txt", b"not-image", "text/plain")),
+    ])
+    assert invalid.status_code == 415
+    assert "files[0]" in invalid.json()["detail"]
+
+    too_many = client.post("/ocr/batch", files=[
+        ("files", (f"{index}.png", b"ignored", "image/png"))
+        for index in range(main_module.MAX_BATCH_IMAGES + 1)
+    ])
+    assert too_many.status_code == 413
 
 
 def test_video_endpoint_preserves_contract_and_ignores_asr_text(monkeypatch):

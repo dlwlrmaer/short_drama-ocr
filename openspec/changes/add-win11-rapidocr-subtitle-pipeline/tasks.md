@@ -56,3 +56,9 @@
 
 - [x] 9.1 增加 `auto/win11/linux-low-vram` 运行 profile、模型配置和环境变量覆盖；Windows 默认 PP-OCRv6 small 与 CUDA 优先，Linux 默认 PP-OCRv5 mobile 与 CPU，并在健康状态中公开实际配置
 - [x] 9.2 将 Win11 脚本和 Docker Compose 分别固定到对应 profile，扩展 ASR 命令行、README 与单元测试，并真实预热两种模型验证实际 Provider
+
+## 10. 背景抑制与单图/批量输入
+
+- [x] 10.1 检测操作系统、系统内存、NVIDIA GPU 与显存，自动选择 Windows/Linux 模型、Provider、背景抑制模式和批量上限，并允许环境变量覆盖
+- [x] 10.2 在视频帧字幕 ROI 上实现空间背景硬遮罩及高配原图/遮罩双分支，保留 OCR 后文字框中心过滤，并为完整图片请求增加 `subtitle=true`
+- [x] 10.3 保留 `/ocr` 单图契约，新增按输入顺序返回且逐张释放内存的 `/ocr/batch`，覆盖 Provider 复用、非法图片和批量超限测试并更新 README

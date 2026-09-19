@@ -16,6 +16,7 @@
 - 更新互相冲突的模型选择文档，以最新《瑶瑶如她》评估结论作为 Win11 默认方案，并补充 GPU 实测及完整评估集 ASR 时间窗对照结果。
 - 增加 ASR 文件适配层和 Win11 命令行入口，直接读取 `transcript.json` 的 `source_file`、`media_id` 与时间段，校验源视频身份后原子写出可供 `ocr-propose` 使用的 `ocr_evidence.json`。
 - 增加跨主机运行 profile：Windows 11 自动使用 PP-OCRv6 small 并优先 CUDA；Linux 低显存主机自动使用 PP-OCRv5 mobile 与 CPU，允许用环境变量显式覆盖模型和 Provider。
+- 图片 OCR 同时支持单图和有上限的批量上传；完整视频帧可启用字幕 ROI 与背景硬遮罩，批量上限和遮罩分支按检测到的系统内存与显存自动调整。
 
 ## Capabilities
 

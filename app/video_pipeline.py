@@ -277,6 +277,39 @@ def _merged_bbox(boxes: list[SubtitleBox]) -> tuple[float, float, float, float]:
     return left, top, right - left, bottom - top
 
 
+def spatial_subtitle_mask(
+    array: np.ndarray,
+    crop: tuple[int, int, int, int],
+    frame_size: tuple[int, int],
+    center_band: tuple[float, float],
+    padding: float = 0.04,
+) -> np.ndarray:
+    """Black out pixels outside the subtitle band before text detection."""
+    _, crop_y0, _, crop_y1 = crop
+    _, frame_height = frame_size
+    keep_y0 = round(frame_height * max(0.0, center_band[0] - padding)) - crop_y0
+    keep_y1 = round(frame_height * min(1.0, center_band[1] + padding)) - crop_y0
+    keep_y0 = max(0, min(array.shape[0], keep_y0))
+    keep_y1 = max(keep_y0, min(array.shape[0], keep_y1))
+    masked = np.zeros_like(array)
+    masked[keep_y0:keep_y1] = array[keep_y0:keep_y1]
+    return masked
+
+
+def _subtitle_boxes(
+    raw_boxes: list[OCRBox], crop_box: tuple[int, int, int, int],
+    frame_size: tuple[int, int], settings: Settings,
+) -> list[SubtitleBox]:
+    boxes = [
+        _full_frame_box(item, crop_box, frame_size)
+        for item in raw_boxes if item.text.strip()
+    ]
+    band_start, band_end = settings.subtitle_center_band
+    boxes = [box for box in boxes if band_start <= box.center[1] <= band_end]
+    boxes.sort(key=lambda box: (round(box.center[1], 2), box.center[0]))
+    return boxes
+
+
 def ocr_subtitle_frame(image: Image.Image, requested_ms: int, pts_ms: int,
                        provider: RapidOCRProvider, settings: Settings) -> FrameOCR:
     width, height = image.size
@@ -287,13 +320,30 @@ def ocr_subtitle_frame(image: Image.Image, requested_ms: int, pts_ms: int,
     crop_box = (x0, y0, x1, y1)
     cropped = image.crop(crop_box)
     array = np.asarray(cropped)
+    masked = spatial_subtitle_mask(
+        array, crop_box, image.size, settings.subtitle_center_band,
+    )
+    if settings.background_suppression == "off":
+        variants = [("original", array)]
+    elif settings.background_suppression == "spatial":
+        variants = [("spatial", masked)]
+    else:
+        variants = [("original", array), ("spatial", masked)]
     started = time.perf_counter()
-    raw_boxes = provider.recognize(array)
+    recognized = [
+        (name, _subtitle_boxes(provider.recognize(variant), crop_box, image.size, settings))
+        for name, variant in variants
+    ]
     elapsed = (time.perf_counter() - started) * 1000
-    boxes = [_full_frame_box(item, crop_box, image.size) for item in raw_boxes if item.text.strip()]
-    band_start, band_end = settings.subtitle_center_band
-    boxes = [box for box in boxes if band_start <= box.center[1] <= band_end]
-    boxes.sort(key=lambda box: (round(box.center[1], 2), box.center[0]))
+    original_boxes = next((boxes for name, boxes in recognized if name == "original"), [])
+    spatial_boxes = next((boxes for name, boxes in recognized if name == "spatial"), [])
+    if settings.background_suppression == "adaptive" and spatial_boxes:
+        original_score = sum(box.score for box in original_boxes) / len(original_boxes) \
+            if original_boxes else 0.0
+        spatial_score = sum(box.score for box in spatial_boxes) / len(spatial_boxes)
+        boxes = spatial_boxes if spatial_score >= original_score - 0.05 else original_boxes
+    else:
+        boxes = recognized[0][1]
     gray = cv2.cvtColor(array, cv2.COLOR_RGB2GRAY)
     sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var()) if gray.size else 0.0
     return FrameOCR(

@@ -44,7 +44,9 @@
 
 备选方案包括 DirectML 和 TensorRT。DirectML 当前处于维护模式且本机是 NVIDIA 显卡；TensorRT 会增加引擎构建、缓存与版本矩阵，本轮先采用 RapidOCR 原生支持的 CUDA Execution Provider。每请求创建引擎也被排除，因为会放大模型加载延迟和显存抖动。
 
-运行时在 Provider 之外增加主机 profile。`auto` 按操作系统解析：Windows 选择 `win11`，沿用 PP-OCRv6 small 和 CUDA 优先策略；Linux 选择 `linux-low-vram`，使用 PP-OCRv5 mobile 和 CPU Provider，避免 2GB 显存被 CUDA Runtime 与模型会话占用。模型与执行模式仍允许显式环境变量覆盖，健康检查同时返回请求 profile 和实际 profile。Docker Compose 固定 `linux-low-vram`，Win11 PowerShell 脚本固定 `win11`，避免容器或远程 shell 的平台判断带来歧义。
+运行时在 Provider 之外增加主机 profile。`auto` 在 Windows 选择 `win11`，沿用 PP-OCRv6 small 和 CUDA 优先策略；Linux 再按显存选择 `linux` 或 `linux-low-vram`。低显存配置使用 PP-OCRv5 mobile 和 CPU Provider，避免 2GB 显存被 CUDA Runtime 与模型会话占用。模型与执行模式仍允许显式环境变量覆盖，健康检查同时返回请求 profile 和实际 profile。Docker Compose 固定 `linux-low-vram`，Win11 PowerShell 脚本固定 `win11`，避免容器或远程 shell 的平台判断带来歧义。
+
+Linux 自动配置进一步读取 `nvidia-smi` 的显存；不少于 4GB 时选择 `linux` 与 v6 small/CUDA 优先，否则选择低显存 CPU 路径。系统内存决定批量上限：不足 8GB 为 8 张，8–16GB 为 16 张，更高配置为 32 张，低显存 profile 默认最高 16 张。检测结果进入健康状态，环境变量可覆盖自动值。
 
 ### 3. 统一候选计划并对每个实际 PTS 只推理一次
 
@@ -57,6 +59,12 @@
 解码帧按 `[0.10, 0.44, 0.85, 0.82]` 裁剪后送入 OCR。引擎输出的多边形或矩形先换算成全画面归一化坐标，再按纵向中心 `0.715–0.815` 过滤。保留下来的框按阅读顺序拼接文字，合并框取所有保留框的外接矩形，置信度使用保留框分数的可解释聚合值。
 
 坐标转换集中在一个函数中并对边界做钳制，避免把 ROI 局部坐标误当作 API 全画面坐标。备选方案是先拼接全部 ROI 文本再做字符串清洗，无法可靠排除同一裁剪区域内的店招和标识。
+
+在文字检测前增加空间背景遮罩：根据全画面字幕中心带并添加安全边距，将 ROI 其余像素置黑。高配 profile 同时识别原始 ROI 和遮罩 ROI，在遮罩结果非空且置信度没有明显下降时选择遮罩结果；低资源 profile 只识别遮罩 ROI。单图与批量接口通过 `subtitle=true` 显式表示输入为完整视频帧，普通文档图片保持全图 OCR。
+
+### 4.1 单图兼容与有界批量输入共用进程级模型
+
+保留 `POST /ocr` 的单文件字段和响应；新增 `POST /ocr/batch`，使用重复的 multipart `files` 字段并按上传序号返回。服务先检查数量上限，再逐张读取、解码、推理和释放数组，因此峰值图片内存不随批量未压缩尺寸线性增长。批量内所有图片复用同一 Provider 和模型会话；某个输入类型或解码失败时返回带数组下标的 4xx 错误，模型错误返回 503。
 
 ### 5. 把边界优化实现为确定性的 segment 选择器
 

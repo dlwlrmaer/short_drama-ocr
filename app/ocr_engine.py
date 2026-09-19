@@ -32,6 +32,11 @@ class ProviderStatus:
     requested_profile: str = "auto"
     active_profile: str = "win11"
     requested_mode: str = "auto"
+    hardware_tier: str = "standard"
+    total_memory_mb: int | None = None
+    gpu_memory_mb: int | None = None
+    max_batch_images: int = 32
+    background_suppression: str = "adaptive"
     actual_provider: str | None = None
     session_providers: dict[str, list[str]] | None = None
     gpu_device: str | None = None
@@ -131,6 +136,11 @@ class RapidOCRProvider:
             requested_profile=self.settings.requested_profile,
             active_profile=self.settings.runtime_profile,
             requested_mode=self.settings.execution_mode,
+            hardware_tier=self.settings.hardware_tier,
+            total_memory_mb=self.settings.total_memory_mb,
+            gpu_memory_mb=self.settings.gpu_memory_mb,
+            max_batch_images=self.settings.max_batch_images,
+            background_suppression=self.settings.background_suppression,
             model=MODEL_IDS[self.settings.model_profile],
         )
 
@@ -179,8 +189,15 @@ class RapidOCRProvider:
                     requested_profile=self.settings.requested_profile,
                     active_profile=self.settings.runtime_profile,
                     requested_mode=mode,
+                    hardware_tier=self.settings.hardware_tier,
+                    total_memory_mb=self.settings.total_memory_mb,
+                    gpu_memory_mb=self.settings.gpu_memory_mb,
+                    max_batch_images=self.settings.max_batch_images,
+                    background_suppression=self.settings.background_suppression,
                     actual_provider=actual,
-                    session_providers=providers, gpu_device=_gpu_name() if actual == CUDA_PROVIDER else None,
+                    session_providers=providers,
+                    gpu_device=(self.settings.gpu_name or _gpu_name())
+                    if actual == CUDA_PROVIDER else None,
                     model=MODEL_IDS[self.settings.model_profile],
                     rapidocr_version=rapid_version, onnxruntime_version=ort_version,
                     fallback_reason=fallback_reason,

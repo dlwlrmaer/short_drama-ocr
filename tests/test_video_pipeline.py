@@ -20,6 +20,7 @@ from app.video_pipeline import (
     probe_frame_pts,
     process_video,
     select_segment,
+    spatial_subtitle_mask,
 )
 
 
@@ -66,6 +67,39 @@ def test_roi_coordinate_mapping_and_subtitle_band_filtering():
     assert result.confidence == pytest.approx(0.99)
     assert result.bbox == pytest.approx((0.2, 0.715, 0.2, 0.04))
     assert len(result.boxes) == 1
+
+
+def test_spatial_mask_blacks_out_background_outside_subtitle_band():
+    import numpy as np
+
+    image = np.full((380, 750, 3), 255, dtype=np.uint8)
+    masked = spatial_subtitle_mask(
+        image, (100, 440, 850, 820), (1000, 1000), (0.715, 0.815), padding=0,
+    )
+
+    assert not masked[:275].any()
+    assert masked[275:375].all()
+    assert not masked[375:].any()
+
+
+def test_adaptive_background_suppression_prefers_clean_spatial_result():
+    class Provider:
+        def __init__(self):
+            self.calls = 0
+
+        def recognize(self, _image):
+            self.calls += 1
+            if self.calls == 1:
+                return [OCRBox(((100, 275), (400, 275), (400, 315), (100, 315)),
+                               "传单字幕", 0.70)]
+            return [OCRBox(((200, 275), (300, 275), (300, 315), (200, 315)),
+                           "字幕", 0.74)]
+
+    result = ocr_subtitle_frame(
+        Image.new("RGB", (1000, 1000), "white"), 1000, 1000,
+        Provider(), Settings(background_suppression="adaptive"),
+    )
+    assert result.text == "字幕"
 
 
 def test_roi_mapping_clamps_out_of_bounds_boxes_at_other_resolution():

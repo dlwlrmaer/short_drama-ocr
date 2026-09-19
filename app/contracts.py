@@ -6,6 +6,7 @@ from typing import Any
 SCHEMA_VERSION = "1.0"
 MAX_TRANSCRIPT_BYTES = 10 * 1024 * 1024
 MAX_SEGMENTS = 20_000
+MAX_BATCH_IMAGES = 64
 
 
 def validate_segments(document: Any) -> list[dict[str, Any]]:

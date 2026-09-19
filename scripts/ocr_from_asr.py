@@ -24,7 +24,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("transcript", type=Path, help="ASR 生成的 transcript.json")
     parser.add_argument("--video", type=Path, help="覆盖 transcript 中的 source_file")
     parser.add_argument("--output", type=Path, help="默认写到 transcript 同目录的 ocr_evidence.json")
-    parser.add_argument("--profile", choices=("auto", "win11", "linux-low-vram"),
+    parser.add_argument("--profile", choices=("auto", "win11", "linux", "linux-low-vram"),
                         default="auto")
     parser.add_argument("--mode", choices=("auto", "cuda", "cpu"),
                         help="覆盖 profile 的默认执行模式")
