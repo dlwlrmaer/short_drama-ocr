@@ -22,6 +22,16 @@ from pathlib import Path
 
 TIME = re.compile(r"(\d+):(\d+):(\d+)[,.](\d+)\s*-->\s*(\d+):(\d+):(\d+)[,.](\d+)")
 
+# Dependency-free fallback for the script variants seen in the benchmark.  This is
+# deliberately narrow: it reports known Simplified/Traditional shape differences,
+# not arbitrary semantic equivalence.
+SCRIPT_VARIANTS = str.maketrans({
+    "別": "别", "媽": "妈", "爸": "爸", "妳": "你", "爾": "尔", "嗎": "吗",
+    "們": "们", "這": "这", "個": "个", "來": "来", "說": "说", "沒": "没",
+    "對": "对", "裡": "里", "後": "后", "讓": "让", "為": "为", "還": "还",
+    "滾": "滚", "況": "况",
+})
+
 
 def milliseconds(parts):
     hour, minute, second, milli = map(int, parts)
@@ -143,17 +153,24 @@ def prepare(args):
     from PIL import Image
 
     cues = read_srt(args.srt)
+    if args.min_chars:
+        cues = [cue for cue in cues if len(normalize(cue["reference"])) >= args.min_chars]
     if args.max_chars:
         cues = [cue for cue in cues if 1 <= len(normalize(cue["reference"])) <= args.max_chars]
+    if args.include_term:
+        cues = [cue for cue in cues if any(term in normalize(cue["reference"])
+                                           for term in args.include_term)]
     if not cues:
         raise SystemExit("No valid SRT cues found")
     if args.limit < 1:
         raise SystemExit("--limit must be positive")
-    roi = json.loads(args.roi_file.read_text(encoding="utf-8"))["roi"] if args.roi_file else [
+    roi = read_roi_file(args.roi_file, args.canvas) if args.roi_file else [
         args.x0, args.y0, args.x1, args.y1]
     if not (len(roi) == 4 and 0 <= roi[0] < roi[2] <= 1 and 0 <= roi[1] < roi[3] <= 1):
         raise SystemExit("Invalid normalized ROI")
-    selected = [cues[(i * len(cues) + len(cues) // 2) // args.limit] for i in range(args.limit)]
+    sample_count = min(args.limit, len(cues))
+    selected = [cues[(i * len(cues) + len(cues) // 2) // sample_count]
+                for i in range(sample_count)]
     args.out.mkdir(parents=True, exist_ok=True)
     rows = []
     for i, cue in enumerate(selected, 1):
@@ -167,11 +184,71 @@ def prepare(args):
             region.save(image_path)
         rows.append({"image": image_path.name, "video": str(args.video), "at_ms": at_ms,
                      "reference": cue["reference"]})
-    manifest = {"srt": str(args.srt), "roi": roi, "roi_source": str(args.roi_file) if args.roi_file else "manual",
+    manifest = {"srt": str(args.srt), "roi": roi,
+                "roi_source": str(args.roi_file) if args.roi_file else "manual",
+                "roi_canvas": list(args.canvas) if args.canvas else None,
                 "samples": rows,
                 "note": "SRT text and timing are unverified against extracted frames"}
     (args.out / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"Extracted {len(rows)} subtitle crops to {args.out}")
+
+
+def _find_roi(value):
+    """Find an existing ROI in a benchmark/workspace JSON object.
+
+    Returns (roi, coordinate_space) where coordinate_space is "normalized" for
+    [x0,y0,x1,y1] / left/top/right/bottom and "pixels" for x/y/width/height.
+    """
+    if not isinstance(value, dict):
+        return None
+    for key in ("reference_roi", "roi"):
+        candidate = value.get(key)
+        if isinstance(candidate, list) and len(candidate) == 4:
+            return candidate, "normalized"
+        if isinstance(candidate, dict):
+            for names in (("x0", "y0", "x1", "y1"),
+                          ("left", "top", "right", "bottom")):
+                if all(name in candidate for name in names):
+                    return [candidate[name] for name in names], "normalized"
+            for x_name, y_name, w_name in (("x", "y", "width"), ("x", "y", "w")):
+                if all(name in candidate for name in (x_name, y_name, w_name)):
+                    x, y = candidate[x_name], candidate[y_name]
+                    width = candidate[w_name]
+                    height = candidate.get("height", candidate.get("h"))
+                    if height is not None:
+                        return [x, y, x + width, y + height], "pixels"
+    for child in value.values():
+        if isinstance(child, dict):
+            found = _find_roi(child)
+            if found is not None:
+                return found
+    return None
+
+
+def read_roi_file(path, canvas=None):
+    """Read an ROI without estimating one; supports manifests and OCR workspaces.
+
+    Pixel-space ROIs (x/y/width/height, as written by short-drama
+    ocr_workspace.json files) are converted to normalized [x0,y0,x1,y1] when a
+    canvas size is supplied as (width, height).  No ROI is ever invented here.
+    """
+    data = json.loads(path.read_text(encoding="utf-8-sig"))
+    found = _find_roi(data)
+    if found is None:
+        raise SystemExit(f"No roi/reference_roi found in {path}")
+    roi, space = found
+    try:
+        roi = [float(value) for value in roi]
+    except (TypeError, ValueError) as exc:
+        raise SystemExit(f"Non-numeric ROI in {path}") from exc
+    if space == "pixels":
+        if not canvas:
+            raise SystemExit(f"Pixel ROI in {path} needs --canvas WIDTHxHEIGHT to normalize")
+        width, height = canvas
+        if width <= 0 or height <= 0:
+            raise SystemExit("Canvas size must be positive")
+        roi = [roi[0] / width, roi[1] / height, roi[2] / width, roi[3] / height]
+    return roi
 
 
 def merge(args):
@@ -207,6 +284,99 @@ def edit_distance(a, b):
                                previous[j - 1] + (char_a != char_b)))
         previous = current
     return previous[-1]
+
+
+def edit_counts(reference, detected):
+    """Return Levenshtein insert/delete/substitute counts with stable tie breaks."""
+    rows, columns = len(reference) + 1, len(detected) + 1
+    table = [[None] * columns for _ in range(rows)]
+    table[0][0] = (0, 0, 0, 0)
+    for i in range(1, rows):
+        table[i][0] = (i, 0, i, 0)
+    for j in range(1, columns):
+        table[0][j] = (j, j, 0, 0)
+    for i in range(1, rows):
+        for j in range(1, columns):
+            if reference[i - 1] == detected[j - 1]:
+                table[i][j] = table[i - 1][j - 1]
+                continue
+            candidates = []
+            cost, ins, delete, sub = table[i][j - 1]
+            candidates.append((cost + 1, ins + 1, delete, sub))
+            cost, ins, delete, sub = table[i - 1][j]
+            candidates.append((cost + 1, ins, delete + 1, sub))
+            cost, ins, delete, sub = table[i - 1][j - 1]
+            candidates.append((cost + 1, ins, delete, sub + 1))
+            table[i][j] = min(candidates)
+    _, insertions, deletions, substitutions = table[-1][-1]
+    return {"insertions": insertions, "deletions": deletions,
+            "substitutions": substitutions}
+
+
+def length_band(length):
+    if 1 <= length <= 2:
+        return "1-2"
+    if 3 <= length <= 4:
+        return "3-4"
+    return "other"
+
+
+def summarize_results(engine, load_seconds, note, results):
+    def metrics(rows):
+        total_chars = sum(row["reference_chars"] for row in rows)
+        total_edits = sum(row["edit_distance"] for row in rows)
+        return {
+            "samples": len(rows),
+            "exact_matches": sum(row["edit_distance"] == 0 for row in rows),
+            "exact_match_rate": round(sum(row["edit_distance"] == 0 for row in rows) / len(rows), 3)
+            if rows else None,
+            "srt_proxy_cer": round(total_edits / total_chars, 3) if total_chars else None,
+            "empty_results": sum(not row["detected"] for row in rows),
+            "script_variant_matches": sum(row["difference_kind"] == "script_variant" for row in rows),
+            "inserted_noise_results": sum(row["difference_kind"] == "contains_inserted_noise"
+                                          for row in rows),
+            "inserted_noise_chars": sum(row["edit_counts"]["insertions"] for row in rows),
+            "difference_kinds": {
+                kind: sum(row["difference_kind"] == kind for row in rows)
+                for kind in ("exact", "script_variant", "contains_inserted_noise",
+                             "other_error", "empty")
+            },
+        }
+
+    latencies = sorted(row["latency_ms"] for row in results[1:])
+    p95_index = max(0, (95 * len(latencies) + 99) // 100 - 1) if latencies else None
+    summary = {"engine": engine, **metrics(results), "load_seconds": round(load_seconds, 2),
+               "median_warm_latency_ms": latencies[len(latencies) // 2] if latencies else None,
+               "p95_warm_latency_ms": latencies[p95_index] if latencies else None,
+               "by_reference_length": {
+                   band: metrics([row for row in results if row["length_band"] == band])
+                   for band in ("1-2", "3-4", "other")
+               },
+               "note": note}
+    return summary
+
+
+def score_result(row):
+    """Recompute proxy OCR metrics from an existing reference/prediction pair."""
+    prediction = row.get("prediction", "".join(row.get("detected_lines", [])))
+    reference = normalize(row["reference"])
+    detected = normalize(prediction)
+    distance = edit_distance(reference, detected)
+    counts = edit_counts(reference, detected)
+    if not detected:
+        difference_kind = "empty"
+    elif distance == 0:
+        difference_kind = "exact"
+    elif reference.translate(SCRIPT_VARIANTS) == detected.translate(SCRIPT_VARIANTS):
+        difference_kind = "script_variant"
+    elif counts["insertions"]:
+        difference_kind = "contains_inserted_noise"
+    else:
+        difference_kind = "other_error"
+    return {**row, "prediction": prediction, "detected": detected,
+            "edit_distance": distance, "edit_counts": counts,
+            "difference_kind": difference_kind, "reference_chars": len(reference),
+            "length_band": length_band(len(reference))}
 
 
 def make_engine(name):
@@ -262,27 +432,41 @@ def run(args):
         start = time.perf_counter()
         texts = infer(args.frames / row["image"])
         elapsed_ms = round((time.perf_counter() - start) * 1000)
-        prediction = "".join(texts)
-        reference = normalize(row["reference"])
-        detected = normalize(prediction)
-        distance = edit_distance(reference, detected)
-        result = {**row, "detected_lines": texts, "prediction": prediction,
-                  "edit_distance": distance, "reference_chars": len(reference),
-                  "latency_ms": elapsed_ms}
+        result = score_result({**row, "detected_lines": texts,
+                               "prediction": "".join(texts), "latency_ms": elapsed_ms})
         results.append(result)
-        print(f"{row['image']}: {row['reference']} => {prediction} ({elapsed_ms} ms)", flush=True)
-    total_chars = sum(row["reference_chars"] for row in results)
-    total_edits = sum(row["edit_distance"] for row in results)
-    latencies = sorted(row["latency_ms"] for row in results[1:])
-    summary = {"engine": args.engine, "samples": len(results), "load_seconds": round(load_seconds, 2),
-               "srt_proxy_cer": round(total_edits / total_chars, 3) if total_chars else None,
-               "exact_matches": sum(row["edit_distance"] == 0 for row in results),
-               "median_warm_latency_ms": latencies[len(latencies) // 2] if latencies else None,
-               "note": manifest["note"]}
+        print(f"{row['image']}: {row['reference']} => {result['prediction']} "
+              f"({elapsed_ms} ms)", flush=True)
+    summary = summarize_results(args.engine, load_seconds, manifest["note"], results)
     report = {"summary": summary, "results": results}
     (args.frames / f"{args.engine}_results.json").write_text(
         json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(summary, ensure_ascii=False, indent=2))
+
+
+def rescore(args):
+    """Refresh metrics for stored OCR predictions without running inference again."""
+    report = json.loads(args.results.read_text(encoding="utf-8"))
+    prior = report.get("summary", {})
+    rows = [score_result(row) for row in report["results"]]
+    summary = summarize_results(prior.get("engine", args.results.stem.removesuffix("_results")),
+                                prior.get("load_seconds", 0), prior.get("note", ""), rows)
+    output = args.out or args.results
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps({"summary": summary, "results": rows},
+                                 ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"Rescored {len(rows)} stored predictions to {output}")
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+
+
+def canvas_size(value):
+    match = re.fullmatch(r"\s*(\d+)\s*[xX]\s*(\d+)\s*", value)
+    if not match:
+        raise argparse.ArgumentTypeError("canvas must be WIDTHxHEIGHT, e.g. 1080x1920")
+    width, height = int(match.group(1)), int(match.group(2))
+    if width <= 0 or height <= 0:
+        raise argparse.ArgumentTypeError("canvas dimensions must be positive")
+    return (width, height)
 
 
 def main():
@@ -295,7 +479,14 @@ def main():
     prep.add_argument("--limit", type=int, default=16)
     prep.add_argument("--max-chars", type=int, default=0,
                       help="only sample SRT cues with at most this many alphanumeric characters")
+    prep.add_argument("--min-chars", type=int, default=0,
+                      help="only sample SRT cues with at least this many alphanumeric characters")
+    prep.add_argument("--include-term", action="append", default=[],
+                      help="only sample cues containing one of these normalized terms; repeatable")
     prep.add_argument("--roi-file", type=Path)
+    prep.add_argument("--canvas", type=canvas_size, default=None,
+                      help="WIDTHxHEIGHT reference canvas so a pixel-space "
+                           "reference_roi can be normalized (e.g. 1080x1920)")
     prep.add_argument("--x0", type=float, default=0.1)
     prep.add_argument("--y0", type=float, default=0.44)
     prep.add_argument("--x1", type=float, default=0.85)
@@ -310,6 +501,9 @@ def main():
                                               "rapidocr_v5_mobile", "rapidocr_v5_server",
                                               "paddleocr"], required=True)
     runner.add_argument("--limit", type=int, help="uniformly sample N extracted frames")
+    scorer = commands.add_parser("rescore")
+    scorer.add_argument("--results", type=Path, required=True)
+    scorer.add_argument("--out", type=Path)
     locator = commands.add_parser("locate")
     locator.add_argument("--video", type=Path, required=True)
     locator.add_argument("--srt", type=Path, required=True)
@@ -324,6 +518,8 @@ def main():
         merge(args)
     elif args.command == "run":
         run(args)
+    elif args.command == "rescore":
+        rescore(args)
     else:
         locate(args)
 
