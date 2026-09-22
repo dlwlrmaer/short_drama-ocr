@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import subprocess
 import tempfile
 import time
 from bisect import bisect_left
 from dataclasses import dataclass
+from fractions import Fraction
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Iterable, Iterator
@@ -139,7 +141,7 @@ def decode_frame(video_path: Path, requested_ms: int, timeout: int = 60) -> tupl
     return image, round(float(match.group(1)) * 1000)
 
 
-def probe_frame_pts(video_path: Path, timeout: int = 120) -> list[tuple[int, int]]:
+def probe_frame_pts(video_path: Path, timeout: int = 900) -> list[tuple[int, int]]:
     """Return (decoded frame index, real PTS ms) without decoding image pixels."""
     command = [
         "ffprobe", "-v", "error", "-select_streams", "v:0",
@@ -208,11 +210,54 @@ def _balanced_select_expression(frame_indexes: list[int]) -> str:
     return expressions[0]
 
 
+def _cfr_targets(
+    video_path: Path, requested_points: Iterable[int], timeout: int = 30,
+) -> list[tuple[int, int, int]] | None:
+    """Map timestamps from CFR metadata without scanning every decoded frame."""
+    if not video_path.is_file():
+        return None
+    command = [
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=avg_frame_rate,r_frame_rate,start_time,nb_frames",
+        "-of", "json", str(video_path),
+    ]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True,
+                                check=False, timeout=timeout)
+        stream = json.loads(result.stdout)["streams"][0]
+        average = Fraction(stream["avg_frame_rate"])
+        nominal = Fraction(stream["r_frame_rate"])
+        frame_count = int(stream["nb_frames"])
+        start_ms = round(float(stream.get("start_time") or 0) * 1000)
+    except (FileNotFoundError, subprocess.TimeoutExpired, KeyError, IndexError,
+            TypeError, ValueError, json.JSONDecodeError, ZeroDivisionError):
+        return None
+    if result.returncode != 0 or average <= 0 or average != nominal or frame_count <= 0:
+        return None
+    by_index: dict[int, tuple[int, int, int]] = {}
+    for requested_ms in sorted(set(requested_points)):
+        relative_ms = max(0, requested_ms - start_ms)
+        frame_index = math.ceil(relative_ms * average.numerator
+                                / (1000 * average.denominator))
+        if frame_index >= frame_count:
+            continue
+        pts_ms = start_ms + round(frame_index * 1000 * average.denominator
+                                  / average.numerator)
+        candidate = (frame_index, requested_ms, pts_ms)
+        current = by_index.get(frame_index)
+        if current is None or abs(pts_ms - requested_ms) < abs(pts_ms - current[1]):
+            by_index[frame_index] = candidate
+    return sorted(by_index.values())
+
+
 def decode_frames(
     video_path: Path, requested_points: Iterable[int], timeout: int = 900,
 ) -> Iterator[DecodedFrame]:
     """Decode every requested frame with one FFmpeg process and bounded memory."""
-    targets = _map_requests_to_frames(requested_points, probe_frame_pts(video_path))
+    points = list(requested_points)
+    targets = _cfr_targets(video_path, points)
+    if targets is None:
+        targets = _map_requests_to_frames(points, probe_frame_pts(video_path))
     if not targets:
         return
     select_expression = _balanced_select_expression(

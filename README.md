@@ -99,7 +99,26 @@ curl -X POST 'http://localhost:8080/ocr/batch?subtitle=true' \
 
 Python 调用方也可以直接调用 `app.asr_adapter.run_asr_transcript()` 和 `save_evidence()`。适配层只读取 segment 的时间字段，不会把 `asr_text` 作为识别提示。
 
+目录中没有可信字幕文件时，可以直接从视频音轨生成独立 ASR 时间轴，再批量执行 OCR。下面的流程不读取素材目录中的 SRT，ASR 文字也不会传给 OCR：
+
+```powershell
+# ASR 环境需要 funasr、modelscope 和 CUDA PyTorch
+C:\Users\user\.venvs\short-drama-asr\Scripts\python.exe `
+  scripts\transcribe_asr_batch.py E:\media\drama `
+  --engine funasr --model paraformer-zh
+
+# OCR 环境自动选择当前 Win/Linux 硬件配置
+.\.venv\Scripts\python.exe scripts\ocr_asr_batch.py `
+  E:\media\drama\ocr\asr `
+  --output E:\media\drama\ocr `
+  --dense-ms 5000
+```
+
+ASR 脚本复用一个模型实例，并按词时间戳生成字幕尺度的候选窗。OCR 脚本支持 `--episodes 1 5-10`、逐集原子落盘和断点续跑；输出包含 `subtitles/*.srt`、`evidence/*.json`、`subtitle_roi.json` 和 `ocr_report.json`。
+
 生产视频管线会先将候选时刻映射到真实帧 PTS，再由一个 FFmpeg 进程批量导出全部去重候选。第 31 集的 306 个候选在 RTX 4070 上从逐点解码约 572 秒缩短到 80.349 秒，输出的 13 条 detection 与优化前 JSON 完全一致。
+
+对具有 `avg_frame_rate == r_frame_rate` 和 `nb_frames` 的固定帧率视频，管线直接由帧率元数据计算候选帧编号，避免先用 FFprobe 扫描全部帧；其他视频自动回退到逐帧 PTS 映射。
 
 服务另外保留 `/ocr/video` 上传接口。上传字段为 `video`（视频文件）和
 `transcript`（参考 `short_drama-asr` 的 UTF-8 JSON，至少包含带 `start_ms`、
