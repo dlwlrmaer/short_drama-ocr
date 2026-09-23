@@ -50,3 +50,19 @@ def test_implausible_tiny_detection_is_rejected():
     tiny.bbox = (0.45, 0.69, 0.02, 0.01)
     assert sequence_detections([tiny], [{"start_ms": 400, "end_ms": 600}],
                                duration_ms=1000, speech_ms=250, fallback_ms=500) == []
+
+
+def test_repeated_caption_after_visible_blank_is_separate_cue():
+    frames = [frame(100, "你放开我"), frame(350, "你放开我"), frame(600, ""),
+              frame(850, "你放开我"), frame(1100, "你放开我")]
+    detections = sequence_detections(frames, [{"start_ms": 0, "end_ms": 1200}],
+                                     duration_ms=1400, speech_ms=250, fallback_ms=450)
+    assert [row["ocr_text"] for row in detections] == ["你放开我", "你放开我"]
+
+
+def test_one_frame_ocr_dropout_does_not_duplicate_caption():
+    frames = [frame(100, "你放开我"), frame(350, ""),
+              frame(600, "你放开我"), frame(850, "你放开我")]
+    detections = sequence_detections(frames, [], duration_ms=1000,
+                                     speech_ms=250, fallback_ms=450)
+    assert len(detections) == 1

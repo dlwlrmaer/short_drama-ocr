@@ -63,19 +63,35 @@ def normalize_ocr_text(value: str) -> str:
     return value.strip().replace("亖", "死").replace("三", "死")
 
 
-def _group_frames(frames: list[FrameOCR], max_gap_ms: int) -> list[_Run]:
+def _group_frames(frames: list[FrameOCR], max_gap_ms: int,
+                  blank_break_ms: int) -> list[_Run]:
     runs: list[_Run] = []
     active: _Run | None = None
+    blank_seen = False
     for row in frames:
         if not row.text.strip():
+            blank_seen = True
             continue
         if (active is not None and row.pts_ms - active.last_ms <= max_gap_ms
-                and _same_text(active.best.text, row.text)):
+                and _same_text(active.best.text, row.text)
+                and not (blank_seen and row.pts_ms - active.last_ms >= blank_break_ms
+                         and len(active.observations) >= 2)):
             active.observations.append(row)
         else:
             active = _Run([row])
             runs.append(active)
-    return runs
+        blank_seen = False
+    # One OCR dropout can briefly split a continuous caption. Require the new
+    # appearance to be confirmed by at least two frames before keeping it.
+    merged: list[_Run] = []
+    for run in runs:
+        if (merged and (len(merged[-1].observations) == 1 or len(run.observations) == 1)
+                and run.first_ms - merged[-1].last_ms <= max_gap_ms
+                and _same_text(merged[-1].best.text, run.best.text)):
+            merged[-1].observations.extend(run.observations)
+        else:
+            merged.append(run)
+    return merged
 
 
 def _speech_overlap(start_ms: int, end_ms: int,
@@ -89,7 +105,8 @@ def sequence_detections(frames: list[FrameOCR], segments: list[dict[str, Any]],
                         ) -> list[dict[str, Any]]:
     """Keep every distinct visual subtitle track, with estimated screen times."""
     frames = sorted(frames, key=lambda row: row.pts_ms)
-    runs = _group_frames(frames, max_gap_ms=max(2 * fallback_ms, 2 * speech_ms))
+    runs = _group_frames(frames, max_gap_ms=max(2 * fallback_ms, 2 * speech_ms),
+                         blank_break_ms=max(400, min(speech_ms, fallback_ms)))
     detections: list[dict[str, Any]] = []
     for index, run in enumerate(runs):
         best = run.best

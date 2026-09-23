@@ -112,7 +112,7 @@ C:\Users\user\.venvs\short-drama-asr\Scripts\python.exe `
   E:\media\drama\ocr\asr
 ```
 
-ASR 脚本复用一个模型实例，并按词时间戳生成字幕尺度的候选窗。OCR 脚本默认启用 `sequence` 模式：按 Win11 250ms / Linux 450ms 扫描语音附近画面，同时按 Win11 450ms / Linux 700ms 扫描全片。每次字幕文字变化都可产生独立条目，包括同一 ASR 窗中的多条字幕和没有 ASR 窗的短句。ASR 文字不参与识别，素材目录中的 SRT 也不会被读取。字幕中的 `亖` 和 `三` 按当前短剧要求统一替换成 `死`，原字保存在 evidence 的 `raw_ocr_text` 中。
+ASR 脚本复用一个模型实例，并按词时间戳生成字幕尺度的候选窗。OCR 脚本默认启用 `sequence` 模式：按 Win11 250ms / Linux 450ms 扫描语音附近画面，同时按 Win11 450ms / Linux 700ms 扫描全片。每次字幕文字变化都可产生独立条目；同一句在画面消失后再次出现也会拆开。同一 ASR 窗中的多条字幕和没有 ASR 窗的短句均可检出。ASR 文字不参与识别，素材目录中的 SRT 也不会被读取。字幕中的 `亖` 和 `三` 按当前短剧要求统一替换成 `死`，原字保存在 evidence 的 `raw_ocr_text` 中。
 
 默认结果放在 `ocr/refined`，保留旧版结果供对照。脚本支持 `--episodes 1 5-10`、`--speech-ms`、`--fallback-ms`、`--mode legacy`、逐集原子落盘和断点续跑；输出包含 `subtitles/*.srt`、`evidence/*.json`、`subtitle_roi.json` 和 `ocr_report.json`。`sequence` 模式中的 `detected_segments` 是视觉字幕条数，不宜再当作 ASR 窗覆盖率。
 

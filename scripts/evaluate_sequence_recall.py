@@ -68,12 +68,43 @@ def compare(reference: list[dict], detections: list[dict], tolerance_ms: int = 1
             matched_cues[cue_index] = score
             matched_detections.add(detection_index)
     rough_text = sum(score >= 0.5 for score in matched_cues.values())
+    nearby_candidates: dict[int, list[tuple[float, float, int]]] = {}
+    for cue_index, cue in enumerate(reference):
+        midpoint = (cue["start_ms"] + cue["end_ms"]) / 2
+        for detection_index, detection in enumerate(detections):
+            point = int(detection["frame_pts_ms"])
+            if cue["start_ms"] - 2500 <= point <= cue["end_ms"] + 2500:
+                score = SequenceMatcher(None, simplify(cue["text"]),
+                                        simplify(detection["ocr_text"]), autojunk=False).ratio()
+                if score >= 0.5:
+                    nearby_candidates.setdefault(cue_index, []).append(
+                        (score, -abs(point - midpoint), detection_index))
+    nearby_assigned: dict[int, int] = {}
+
+    def assign(cue_index: int, visited: set[int]) -> bool:
+        for _, _, detection_index in sorted(nearby_candidates.get(cue_index, []), reverse=True):
+            if detection_index in visited:
+                continue
+            visited.add(detection_index)
+            previous = nearby_assigned.get(detection_index)
+            if previous is None or assign(previous, visited):
+                nearby_assigned[detection_index] = cue_index
+                return True
+        return False
+
+    for cue_index in range(len(reference)):
+        assign(cue_index, set())
+    nearby_cues = set(nearby_assigned.values())
     return {"reference_cues": len(reference), "detections": len(detections),
             "visual_cues_found": len(matched_cues), "rough_text_matches": rough_text,
+            "nearby_text_matches": len(nearby_cues),
             "visual_recall": round(len(matched_cues) / len(reference), 4) if reference else None,
             "rough_text_recall": round(rough_text / len(reference), 4) if reference else None,
+            "nearby_text_recall": round(len(nearby_cues) / len(reference), 4) if reference else None,
             "missed": [{"start_ms": cue["start_ms"], "text": cue["text"]}
-                       for index, cue in enumerate(reference) if index not in matched_cues]}
+                       for index, cue in enumerate(reference) if index not in matched_cues],
+            "unmatched_nearby": [{"start_ms": cue["start_ms"], "text": cue["text"]}
+                                 for index, cue in enumerate(reference) if index not in nearby_cues]}
 
 
 def main() -> None:
@@ -102,10 +133,12 @@ def main() -> None:
     totals = {}
     for kind in ("baseline", "improved"):
         totals[kind] = {key: sum(row[kind][key] for row in episodes)
-                        for key in ("reference_cues", "detections", "visual_cues_found", "rough_text_matches")}
+                        for key in ("reference_cues", "detections", "visual_cues_found",
+                                    "rough_text_matches", "nearby_text_matches")}
         count = totals[kind]["reference_cues"]
         totals[kind]["visual_recall"] = round(totals[kind]["visual_cues_found"] / count, 4) if count else None
         totals[kind]["rough_text_recall"] = round(totals[kind]["rough_text_matches"] / count, 4) if count else None
+        totals[kind]["nearby_text_recall"] = round(totals[kind]["nearby_text_matches"] / count, 4) if count else None
     result = {"reference_used_for_inference": False, "episodes": episodes, "totals": totals}
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
