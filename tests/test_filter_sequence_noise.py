@@ -22,4 +22,8 @@ def test_noise_filter_keeps_evidence_for_audit_and_rewrites_srt(tmp_path):
     assert report["noise_rejected"] == 1
     assert [row["ocr_text"] for row in saved["detections"]] == ["我来了"]
     assert saved["rejected_noise"][0]["ocr_text"] == "C07C3C496"
-    assert "我来了" in (tmp_path / "subtitles" / "20.srt").read_text(encoding="utf-8")
+    srt = tmp_path / "subtitles" / "20.srt"
+    assert "我来了" in srt.read_text(encoding="utf-8")
+    srt.write_text("stale", encoding="utf-8")
+    assert clean_root(tmp_path)["noise_rejected"] == 1
+    assert "我来了" in srt.read_text(encoding="utf-8")

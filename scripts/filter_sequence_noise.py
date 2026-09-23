@@ -26,7 +26,10 @@ def clean_root(root: Path) -> dict:
         data = json.loads(path.read_text(encoding="utf-8"))
         if data.get("guidance", {}).get("type") != "visual_sequence_asr_timing":
             continue
+        episode = int(path.stem.split("_")[1])
         if data.get("noise_filter", {}).get("version") == 1:
+            write_srt(root / "subtitles" / f"{episode:02d}.srt",
+                      data["segments"], data["detections"])
             episodes += 1
             kept += len(data["detections"])
             removed += len(data.get("rejected_noise", []))
@@ -44,7 +47,6 @@ def clean_root(root: Path) -> dict:
         data["noise_filter"] = {"version": 1, "method": "ocr_character_mix_and_persistence"}
         data["summary"]["detected_segments"] = len(accepted)
         data["summary"]["noise_rejected"] = len(rejected)
-        episode = int(path.stem.split("_")[1])
         save_evidence(path, data)
         write_srt(root / "subtitles" / f"{episode:02d}.srt", data["segments"], accepted)
         episodes += 1
