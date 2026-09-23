@@ -20,6 +20,7 @@ from app.contracts import validate_segments  # noqa: E402
 from app.ocr_engine import RapidOCRProvider  # noqa: E402
 from app.settings import Settings  # noqa: E402
 from app.video_pipeline import process_video  # noqa: E402
+from app.subtitle_sequence import process_video_sequence  # noqa: E402
 
 
 def format_timestamp(value_ms: int) -> str:
@@ -30,10 +31,10 @@ def format_timestamp(value_ms: int) -> str:
 
 
 def write_srt(path: Path, segments: list[dict[str, Any]], detections: list[dict[str, Any]]) -> None:
-    predictions = {row["segment_index"]: row["ocr_text"].strip() for row in detections}
     blocks = []
-    for segment_index, segment in enumerate(segments):
-        text = predictions.get(segment_index, "")
+    for row in detections:
+        segment = row if "start_ms" in row else segments[row["segment_index"]]
+        text = row["ocr_text"].strip()
         if not text:
             continue
         blocks.append(
@@ -76,6 +77,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--center-band", type=float, nargs=2, default=(0.66, 0.74))
     parser.add_argument("--grid-ms", type=int, default=60_000)
     parser.add_argument("--dense-ms", type=int, default=1000)
+    parser.add_argument("--mode", choices=("sequence", "legacy"), default="sequence")
+    parser.add_argument("--speech-ms", type=int, help="语音区间扫描间隔；默认按硬件配置选择")
+    parser.add_argument("--fallback-ms", type=int, help="全片兜底扫描间隔；默认按硬件配置选择")
     parser.add_argument("--overwrite", action="store_true")
     return parser
 
@@ -83,7 +87,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     asr_dir = args.asr_dir.expanduser().resolve()
-    output = (args.output or asr_dir.parent).expanduser().resolve()
+    default_output = asr_dir.parent / ("refined" if args.mode == "sequence" else "")
+    output = (args.output or default_output).expanduser().resolve()
     transcripts = sorted(asr_dir.glob("episode_*/transcript.json"), key=episode_number)
     selected = parse_episode_filter(args.episodes)
     if selected is not None:
@@ -95,15 +100,20 @@ def main(argv: list[str] | None = None) -> int:
         base, roi=tuple(args.roi), subtitle_center_band=tuple(args.center_band),
         grid_ms=args.grid_ms, dense_ms=args.dense_ms,
     )
+    speech_ms = args.speech_ms or (250 if settings.runtime_profile == "win11" else 450)
+    fallback_ms = args.fallback_ms or (450 if settings.runtime_profile == "win11" else 700)
     provider = RapidOCRProvider(settings)
     provider.ensure_ready()
+    locator_frames = output / "locator_frames"
+    if not locator_frames.exists():
+        locator_frames = asr_dir.parent / "locator_frames"
     locator = {
         "method": "visual_model",
         "roi": list(settings.roi),
         "subtitle_center_band": list(settings.subtitle_center_band),
         "sample_episodes": [1, 30, 59],
         "sample_frames": [
-            str(path) for path in sorted((output / "locator_frames").glob("*.png"))
+            str(path) for path in sorted(locator_frames.glob("*.png"))
         ],
     }
     save_evidence(output / "subtitle_roi.json", locator)
@@ -117,7 +127,9 @@ def main(argv: list[str] | None = None) -> int:
         if evidence_path.exists() and not args.overwrite:
             try:
                 existing = json.loads(evidence_path.read_text(encoding="utf-8"))
-                if existing.get("guidance", {}).get("type") == "independent_asr_timing":
+                expected_guidance = ("visual_sequence_asr_timing" if args.mode == "sequence"
+                                     else "independent_asr_timing")
+                if existing.get("guidance", {}).get("type") == expected_guidance:
                     summary = existing["summary"]
                     summaries.append({"episode": episode, **summary, "status": "skipped"})
                     print(json.dumps({"event": "skip", "episode": episode}, ensure_ascii=False), flush=True)
@@ -133,11 +145,18 @@ def main(argv: list[str] | None = None) -> int:
                 "event": "episode_start", "episode": episode,
                 "position": position, "total": len(transcripts), "segments": len(segments),
             }, ensure_ascii=False), flush=True)
-            detections = process_video(video, segments, provider, settings)
+            if args.mode == "sequence":
+                detections = process_video_sequence(
+                    video, segments, provider, settings,
+                    speech_ms=speech_ms, fallback_ms=fallback_ms,
+                )
+            else:
+                detections = process_video(video, segments, provider, settings)
             summary = {
                 "segments": len(segments),
                 "detected_segments": len(detections),
-                "coverage": round(len(detections) / len(segments), 4) if segments else None,
+                "coverage": (round(len(detections) / len(segments), 4) if segments else None)
+                            if args.mode == "legacy" else None,
                 "elapsed_seconds": round(time.perf_counter() - episode_started, 2),
             }
             evidence = {
@@ -146,7 +165,8 @@ def main(argv: list[str] | None = None) -> int:
                 "source_file": str(video),
                 "timebase": "video_ms",
                 "guidance": {
-                    "type": "independent_asr_timing",
+                    "type": ("visual_sequence_asr_timing" if args.mode == "sequence"
+                             else "independent_asr_timing"),
                     "source_file": str(transcript_path),
                     "asr_engine": transcript.get("asr"),
                     "asr_text_used_as_ocr_prompt": False,
@@ -154,6 +174,8 @@ def main(argv: list[str] | None = None) -> int:
                 },
                 "locator": locator,
                 "settings": asdict(settings),
+                "sampling": {"mode": args.mode, "speech_ms": speech_ms,
+                             "fallback_ms": fallback_ms},
                 "provider": provider.status.to_dict(),
                 "segments": segments,
                 "detections": detections,
@@ -172,12 +194,13 @@ def main(argv: list[str] | None = None) -> int:
         "episodes": len(summaries),
         "segments": total_segments,
         "detected_segments": sum(row["detected_segments"] for row in summaries),
-        "coverage": round(sum(row["detected_segments"] for row in summaries) / total_segments, 4)
-                    if total_segments else None,
+        "coverage": (round(sum(row["detected_segments"] for row in summaries) / total_segments, 4)
+                     if total_segments else None) if args.mode == "legacy" else None,
         "elapsed_seconds": round(time.perf_counter() - started, 2),
     }
     report = {
-        "guidance": "independent_asr_timing",
+        "guidance": ("visual_sequence_asr_timing" if args.mode == "sequence"
+                     else "independent_asr_timing"),
         "directory_srt_used": False,
         "provider": provider.status.to_dict(),
         "settings": asdict(settings),

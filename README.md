@@ -109,12 +109,22 @@ C:\Users\user\.venvs\short-drama-asr\Scripts\python.exe `
 
 # OCR 环境自动选择当前 Win/Linux 硬件配置
 .\.venv\Scripts\python.exe scripts\ocr_asr_batch.py `
-  E:\media\drama\ocr\asr `
-  --output E:\media\drama\ocr `
-  --dense-ms 5000
+  E:\media\drama\ocr\asr
 ```
 
-ASR 脚本复用一个模型实例，并按词时间戳生成字幕尺度的候选窗。OCR 脚本支持 `--episodes 1 5-10`、逐集原子落盘和断点续跑；输出包含 `subtitles/*.srt`、`evidence/*.json`、`subtitle_roi.json` 和 `ocr_report.json`。
+ASR 脚本复用一个模型实例，并按词时间戳生成字幕尺度的候选窗。OCR 脚本默认启用 `sequence` 模式：按 Win11 250ms / Linux 450ms 扫描语音附近画面，同时按 Win11 450ms / Linux 700ms 扫描全片。每次字幕文字变化都可产生独立条目，包括同一 ASR 窗中的多条字幕和没有 ASR 窗的短句。ASR 文字不参与识别，素材目录中的 SRT 也不会被读取。字幕中的 `亖` 和 `三` 按当前短剧要求统一替换成 `死`，原字保存在 evidence 的 `raw_ocr_text` 中。
+
+默认结果放在 `ocr/refined`，保留旧版结果供对照。脚本支持 `--episodes 1 5-10`、`--speech-ms`、`--fallback-ms`、`--mode legacy`、逐集原子落盘和断点续跑；输出包含 `subtitles/*.srt`、`evidence/*.json`、`subtitle_roi.json` 和 `ocr_report.json`。`sequence` 模式中的 `detected_segments` 是视觉字幕条数，不宜再当作 ASR 窗覆盖率。
+
+素材自带字幕只用于事后评估时，可运行：
+
+```powershell
+.\.venv\Scripts\python.exe scripts\evaluate_sequence_recall.py `
+  E:\media\drama\字幕文件 `
+  E:\media\drama\ocr\evidence `
+  E:\media\drama\ocr\refined\evidence `
+  --output E:\media\drama\ocr\refined\recall_comparison.json
+```
 
 生产视频管线会先将候选时刻映射到真实帧 PTS，再由一个 FFmpeg 进程批量导出全部去重候选。第 31 集的 306 个候选在 RTX 4070 上从逐点解码约 572 秒缩短到 80.349 秒，输出的 13 条 detection 与优化前 JSON 完全一致。
 
