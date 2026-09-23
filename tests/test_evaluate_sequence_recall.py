@@ -1,4 +1,4 @@
-from scripts.evaluate_sequence_recall import compare, read_srt
+from scripts.evaluate_sequence_recall import compare, read_srt, reference_paths
 
 
 def test_reference_matching_uses_visual_time_and_one_to_one_text(tmp_path):
@@ -28,3 +28,9 @@ def test_nearby_text_match_distinguishes_reference_timing_drift():
     result = compare(reference, [{"frame_pts_ms": 3000, "ocr_text": "你别过来"}])
     assert result["visual_cues_found"] == 0
     assert result["nearby_text_matches"] == 1
+
+
+def test_reference_path_accepts_space_before_extension(tmp_path):
+    path = tmp_path / "58 .srt"
+    path.write_text("", encoding="utf-8")
+    assert reference_paths(tmp_path)[58] == path

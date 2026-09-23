@@ -46,6 +46,12 @@ def read_srt(path: Path) -> list[dict]:
     return cues
 
 
+def reference_paths(directory: Path) -> dict[int, Path]:
+    """Accept source names such as ``58 .srt`` without renaming user files."""
+    return {int(path.stem.strip()): path for path in directory.glob("*.srt")
+            if path.stem.strip().isdecimal()}
+
+
 def simplify(value: str) -> str:
     value = re.sub(r"<[^>]+>", "", value)
     return "".join(char for char in normalize_ocr_text(value)
@@ -115,14 +121,14 @@ def main() -> None:
     parser.add_argument("--episodes", nargs="*", type=int)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
-    numbers = args.episodes or sorted(int(path.stem) for path in args.reference_dir.glob("*.srt")
-                                      if path.stem.isdecimal())
+    sources = reference_paths(args.reference_dir)
+    numbers = args.episodes or sorted(sources)
     episodes = []
     for number in numbers:
-        source = args.reference_dir / f"{number:02d}.srt"
+        source = sources.get(number)
         original = args.baseline_evidence_dir / f"episode_{number:04d}_ocr.json"
         improved = args.improved_evidence_dir / f"episode_{number:04d}_ocr.json"
-        if not (source.is_file() and original.is_file() and improved.is_file()):
+        if not (source and original.is_file() and improved.is_file()):
             continue
         baseline_data = json.loads(original.read_text(encoding="utf-8"))
         improved_data = json.loads(improved.read_text(encoding="utf-8"))
