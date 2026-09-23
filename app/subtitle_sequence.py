@@ -63,6 +63,20 @@ def normalize_ocr_text(value: str) -> str:
     return value.strip().replace("亖", "死").replace("三", "死")
 
 
+def is_background_noise(text: str, confidence: float, observations: int) -> bool:
+    """Reject brief OCR hallucinations from patterned clothes and set dressing."""
+    chars = [char for char in text if char.isalnum()]
+    if not chars or observations >= 3:
+        return False
+    han = sum("\u4e00" <= char <= "\u9fff" for char in chars)
+    digits = sum(char.isdigit() for char in chars)
+    latin = sum(char.isascii() and char.isalpha() for char in chars)
+    if han == 0:
+        return bool((digits and latin) or digits == len(chars) or confidence < 0.9)
+    return (han / len(chars) < 0.5 and latin + digits >= 3
+            and confidence < 0.9)
+
+
 def _group_frames(frames: list[FrameOCR], max_gap_ms: int,
                   blank_break_ms: int) -> list[_Run]:
     runs: list[_Run] = []
@@ -124,6 +138,8 @@ def sequence_detections(frames: list[FrameOCR], segments: list[dict[str, Any]],
             continue
         # Near-zero-height marks and full-ROI short tokens are detector noise.
         if best.bbox[3] < 0.02 or (best.bbox[3] >= 0.13 and len(best.text.strip()) <= 3):
+            continue
+        if is_background_noise(best.text, best.confidence, len(run.observations)):
             continue
         if detections and detections[-1]["end_ms"] > start_ms:
             detections[-1]["end_ms"] = start_ms

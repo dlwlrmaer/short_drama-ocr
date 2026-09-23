@@ -1,4 +1,5 @@
-from app.subtitle_sequence import normalize_ocr_text, sample_points, sequence_detections
+from app.subtitle_sequence import (is_background_noise, normalize_ocr_text,
+                                   sample_points, sequence_detections)
 from app.video_pipeline import FrameOCR, SubtitleBox
 
 
@@ -66,3 +67,12 @@ def test_one_frame_ocr_dropout_does_not_duplicate_caption():
     detections = sequence_detections(frames, [], duration_ms=1000,
                                      speech_ms=250, fallback_ms=450)
     assert len(detections) == 1
+
+
+def test_transient_pattern_noise_is_rejected_without_dropping_short_chinese():
+    assert is_background_noise("C07C3C496", 0.78, 2)
+    assert is_background_noise("139A3心45", 0.64, 1)
+    assert is_background_noise("993", 0.97, 1)
+    assert not is_background_noise("是", 0.72, 1)
+    assert not is_background_noise("1996年", 0.99, 1)
+    assert not is_background_noise("Hello", 0.99, 2)

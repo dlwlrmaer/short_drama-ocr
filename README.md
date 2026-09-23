@@ -116,6 +116,8 @@ ASR 脚本复用一个模型实例，并按词时间戳生成字幕尺度的候�
 
 默认结果放在 `ocr/refined`，保留旧版结果供对照。脚本支持 `--episodes 1 5-10`、`--speech-ms`、`--fallback-ms`、`--mode legacy`、逐集原子落盘和断点续跑；输出包含 `subtitles/*.srt`、`evidence/*.json`、`subtitle_roi.json` 和 `ocr_report.json`。`sequence` 模式中的 `detected_segments` 是视觉字幕条数，不宜再当作 ASR 窗覆盖率。
 
+序列模式会过滤短暂的字母数字花纹误识别。对升级前已生成的序列结果，可运行 `python scripts/filter_sequence_noise.py E:\media\drama\ocr\refined` 重新生成 SRT；被剔除的候选仍保留在 evidence 的 `rejected_noise` 中。此步骤只读取 OCR 证据，不读取素材自带字幕。
+
 素材自带字幕只用于事后评估时，可运行：
 
 ```powershell
