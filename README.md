@@ -63,7 +63,7 @@ python3 -m venv .venv
 pip install -r requirements-cpu.txt
 OCR_RUNTIME_PROFILE=auto uvicorn app.main:app --host 0.0.0.0 --port 8080
 
-# Docker Compose 已显式设置 linux-low-vram
+# Docker Compose 自动检测容器可见的硬件；无可见 GPU 时使用低显存 CPU profile
 docker compose up -d --build
 curl http://localhost:8080/health
 curl -X POST -F 'file=@test.png' http://localhost:8080/ocr
@@ -78,6 +78,25 @@ curl -X POST 'http://localhost:8080/ocr/batch?subtitle=true' \
 ```
 
 单图接口继续返回 `{filename, text}`。批量接口返回 `{count, results}`，其中每条结果包含 `index`、`filename` 和 `text`。批量处理逐张解码和推理，共用同一个已预热模型，不会同时把整批未压缩图片留在内存中。`subtitle=true` 表示输入是完整视频帧：程序会应用字幕 ROI、空间背景遮罩和字幕框过滤；普通文档图片不要开启。
+
+## OCR 与 ASR 双服务调用
+
+OCR 和相邻 `short_drama-asr` 仓库分别有自己的 Dockerfile、Compose 文件和端口，可以独立构建、重启。OCR 保持原有宿主机 `0.0.0.0:8080` 监听，ASR 默认只监听 `127.0.0.1:8090`；需要跨主机调用 ASR 时设置 `ASR_BIND_ADDRESS=0.0.0.0`。OCR 的 `OCR_RUNTIME_PROFILE=auto` 在容器中按可见硬件选型；2 GB 显存且未透传 GPU 时使用 CPU 和轻量模型。
+
+```powershell
+docker compose -f E:\short_drama\asr\docker-compose.yml up -d --build
+docker compose -f E:\short_drama\ocr\docker-compose.yml up -d --build
+curl.exe -f http://localhost:8090/health
+curl.exe -f http://localhost:8080/health
+
+# 用同一视频先生成 ASR JSON，再以该 JSON 的时间轴引导视觉 OCR
+curl.exe -f -F "file=@E:\media\episode.mp4" http://localhost:8090/asr/transcribe -o transcript.json
+curl.exe -f -F "video=@E:\media\episode.mp4" -F "transcript=@transcript.json;type=application/json" http://localhost:8080/ocr/video -o ocr_evidence.json
+```
+
+`POST /ocr/video` 默认以 `sequence` 模式扫描语音附近和全片画面，返回每条视觉字幕的出现时间与文字；`?mode=legacy` 可使用旧版按 ASR 段抽帧。ASR 文字只决定采样时间，不作为 OCR 识别提示。接口会对比 transcript 中的 `media_id` 与上传视频的 SHA-256，避免两个服务误配素材。返回的 `ocr_evidence.json` 可交给 ASR 的 `ocr-propose` 继续做人工确认的同音字纠错。单张图片和批量图片仍分别调用 `/ocr`、`/ocr/batch`。
+
+OCR 容器使用 CPU 依赖；若要在 Docker 中使用 NVIDIA GPU，需要另外安装适配的 GPU 运行时与 ONNX Runtime 依赖，并提供 GPU 透传。Win11 主机也可继续使用本机 `setup_win11.ps1` 的 CUDA 方案。
 
 ## 视频 ASR 抽帧 OCR
 

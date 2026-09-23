@@ -134,7 +134,7 @@ def test_video_endpoint_preserves_contract_and_ignores_asr_text(monkeypatch):
 
     monkeypatch.setattr(main_module, "process_video", fake_process)
     transcript = {"segments": [{"start_ms": 1000, "end_ms": 1300, "text": "错误提示"}]}
-    response = TestClient(app).post("/ocr/video", files={
+    response = TestClient(app).post("/ocr/video?mode=legacy", files={
         "video": ("episode.mp4", b"video", "video/mp4"),
         "transcript": ("transcript.json", json.dumps(transcript).encode(), "application/json"),
     })
@@ -144,6 +144,38 @@ def test_video_endpoint_preserves_contract_and_ignores_asr_text(monkeypatch):
     assert body["timebase"] == "video_ms"
     assert body["detections"][0]["asr_text_prompted"] is False
     assert captured == [[{"start_ms": 1000, "end_ms": 1300}]]
+
+
+def test_video_endpoint_defaults_to_sequence_and_rejects_wrong_media(monkeypatch):
+    monkeypatch.setattr(main_module, "get_provider", lambda: FakeProvider())
+    captured = []
+
+    def fake_sequence(path, segments, provider, settings):
+        captured.append(segments)
+        return [{"id": "visual-000001", "start_ms": 100, "end_ms": 500,
+                 "frame_pts_ms": 200, "ocr_text": "妈", "kind": "subtitle",
+                 "asr_text_prompted": False}]
+
+    monkeypatch.setattr(main_module, "process_video_sequence", fake_sequence)
+    client = TestClient(app)
+    video = b"video"
+    files = {
+        "video": ("episode.mp4", video, "video/mp4"),
+        "transcript": ("transcript.json", json.dumps({
+            "media_id": hashlib.sha256(video).hexdigest(),
+            "segments": [{"start_ms": 100, "end_ms": 500, "asr_text": "无关"}],
+        }).encode(), "application/json"),
+    }
+    response = client.post("/ocr/video", files=files)
+    assert response.status_code == 200
+    assert captured == [[{"start_ms": 100, "end_ms": 500}]]
+    assert response.json()["detections"][0]["ocr_text"] == "妈"
+
+    bad = client.post("/ocr/video", files={**files, "transcript": (
+        "transcript.json", json.dumps({"media_id": "0" * 64, "segments": []}).encode(),
+        "application/json")})
+    assert bad.status_code == 400
+    assert len(captured) == 1
 
 
 def test_health_exposes_provider_and_ffmpeg(monkeypatch):

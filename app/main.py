@@ -4,16 +4,18 @@ import shutil
 import tempfile
 from io import BytesIO
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
+from fastapi.concurrency import run_in_threadpool
 from PIL import Image, UnidentifiedImageError
 
-from .contracts import MAX_BATCH_IMAGES, MAX_TRANSCRIPT_BYTES, validate_segments
+from .contracts import MAX_BATCH_IMAGES, MAX_TRANSCRIPT_BYTES, SCHEMA_VERSION, validate_segments
 from .ocr_engine import get_provider
 from .settings import Settings
+from .subtitle_sequence import process_video_sequence
 from .video_pipeline import ocr_subtitle_frame, process_video
 
 
@@ -119,7 +121,10 @@ def sample_points(segments: list[dict[str, Any]], duration_ms: int | None = None
 
 
 @app.post("/ocr/video")
-async def video_ocr(video: UploadFile = File(...), transcript: UploadFile = File(...)) -> dict[str, Any]:
+async def video_ocr(
+    video: UploadFile = File(...), transcript: UploadFile = File(...),
+    mode: Literal["sequence", "legacy"] = "sequence",
+) -> dict[str, Any]:
     if not video.filename or not video.content_type or not video.content_type.startswith("video/"):
         raise HTTPException(status_code=415, detail="请上传视频文件")
     transcript_bytes = await transcript.read(MAX_TRANSCRIPT_BYTES + 1)
@@ -137,12 +142,19 @@ async def video_ocr(video: UploadFile = File(...), transcript: UploadFile = File
             while chunk := await video.read(1024 * 1024):
                 digest.update(chunk)
                 target.write(chunk)
+        supplied_media_id = document.get("media_id")
+        if supplied_media_id is not None and supplied_media_id != digest.hexdigest():
+            raise HTTPException(status_code=400, detail="transcript media_id 与上传视频不一致")
         try:
             provider = get_provider()
             provider.ensure_ready()
-            detections = process_video(video_path, segments, provider, Settings.from_env())
+            process = process_video_sequence if mode == "sequence" else process_video
+            detections = await run_in_threadpool(
+                process, video_path, segments, provider, Settings.from_env(),
+            )
         except RuntimeError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         except Exception as exc:
             raise HTTPException(status_code=503, detail=f"OCR 引擎不可用: {exc}") from exc
-    return {"media_id": digest.hexdigest(), "timebase": "video_ms", "detections": detections}
+    return {"schema_version": SCHEMA_VERSION, "media_id": digest.hexdigest(),
+            "timebase": "video_ms", "detections": detections}

@@ -115,7 +115,8 @@ def _speech_overlap(start_ms: int, end_ms: int,
 
 
 def sequence_detections(frames: list[FrameOCR], segments: list[dict[str, Any]],
-                        duration_ms: int, speech_ms: int, fallback_ms: int
+                        duration_ms: int, speech_ms: int, fallback_ms: int,
+                        engine_version: str = "rapidocr"
                         ) -> list[dict[str, Any]]:
     """Keep every distinct visual subtitle track, with estimated screen times."""
     frames = sorted(frames, key=lambda row: row.pts_ms)
@@ -154,6 +155,8 @@ def sequence_detections(frames: list[FrameOCR], segments: list[dict[str, Any]],
             "observations": len(run.observations),
             "guidance": "asr_timing" if guided else "visual_fallback",
             "asr_text_prompted": False,
+            "kind": "subtitle",
+            "engine_version": engine_version,
         })
     return detections
 
@@ -176,4 +179,7 @@ def process_video_sequence(video_path: Path, segments: list[dict[str, Any]],
                                              decoded.pts_ms, provider, settings))
     if not frames:
         raise RuntimeError("视频没有可解码的采样帧")
-    return sequence_detections(frames, segments, duration_ms, speech_ms, fallback_ms)
+    status = provider.status
+    engine_version = f"{status.model}@{status.rapidocr_version or 'unknown'}"
+    return sequence_detections(frames, segments, duration_ms, speech_ms,
+                               fallback_ms, engine_version)

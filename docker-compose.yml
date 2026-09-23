@@ -4,9 +4,9 @@ services:
     container_name: ocr-app
     restart: unless-stopped
     environment:
-      OCR_RUNTIME_PROFILE: linux-low-vram
+      OCR_RUNTIME_PROFILE: ${OCR_RUNTIME_PROFILE:-auto}
     ports:
-      - "8080:8080"
+      - "${OCR_BIND_ADDRESS:-0.0.0.0}:${OCR_PORT:-8080}:8080"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health')"]
       interval: 30s
